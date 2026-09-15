@@ -1,0 +1,26 @@
+[package]
+name = "eish"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Generate self-contained installation scripts (bash, fish, PowerShell) for GitHub release binaries"
+license = "MIT OR Apache-2.0"
+keywords = ["installer", "shell", "script", "github", "release"]
+categories = ["command-line-utilities", "development-tools"]
+repository = "https://github.com/easy-install/eish"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive", "env"] }
+guess-target = { git = "https://github.com/ahaoboy/guess-target.git", version = "0.1.6", features = ["serde"] }
+minijinja = { version = "2.24.0", features = ["custom_syntax"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+ureq = { version = "3.4.2", features = ["json", "gzip"] }
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+
+[dev-dependencies]
+tempfile = "3.27.0"
