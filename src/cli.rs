@@ -83,7 +83,10 @@ pub struct Cli {
     api_base: String,
 
     /// GitHub token used for the API request.
-    #[arg(long, env = "GITHUB_TOKEN", hide_env_values = true)]
+    ///
+    /// When omitted, `GITHUB_TOKEN`, `GH_TOKEN`, `gh auth token` and
+    /// `git credential fill` are tried in turn.
+    #[arg(long)]
     token: Option<String>,
 
     /// Read the release from a JSON file instead of calling the API.
@@ -179,13 +182,18 @@ impl Cli {
             (_, false) => None,
             (Some(path), _) => Some(release_from_json_file(path)?),
             (None, _) => {
+                let client = Client::new()
+                    .with_api_base(self.api_base.clone())
+                    .with_token(self.token.clone());
+
+                // Say which credential is in play, so a later 403 is easy to
+                // attribute to the wrong token rather than to rate limiting.
+                if let Some(source) = client.credential_source() {
+                    self.progress(&format!("using credentials from {source}"))?;
+                }
+
                 self.progress(&format!("querying GitHub for {}", spec.slug()))?;
-                Some(
-                    Client::new()
-                        .with_api_base(self.api_base.clone())
-                        .with_token(self.token.clone())
-                        .release(&spec.owner, &spec.repo, Some(&spec.tag))?,
-                )
+                Some(client.release(&spec.owner, &spec.repo, Some(&spec.tag))?)
             }
         };
 

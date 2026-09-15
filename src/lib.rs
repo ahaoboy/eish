@@ -51,6 +51,7 @@ pub mod render;
 pub mod shell;
 pub mod spec;
 pub mod target;
+pub mod token;
 
 pub use error::{Error, Result};
 pub use github::{Asset, Client, Release};
@@ -59,3 +60,4 @@ pub use render::render;
 pub use shell::Shell;
 pub use spec::{AssetEntry, InstallSpec, RepoSpec, Resource};
 pub use target::{KNOWN_TARGETS, guess_target, guess_targets};
+pub use token::Token;
