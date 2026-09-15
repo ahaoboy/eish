@@ -53,10 +53,65 @@ jobs:
           allowUpdates: true
           features: cli
 
+  # Generates a real installer for a few public repositories, runs each one, and
+  # checks that an executable lands on disk. Between them these releases cover
+  # the naming schemes that matter — full Rust triples, bare binaries with no
+  # extension, and OS/arch-only names such as `ant-linux-x64` and
+  # `qjs-linux-x86` — so a regression in platform detection or asset selection
+  # fails the release instead of a user's install.
+  #
+  # One runner per OS: the interesting part is running the same installer on
+  # each platform, which the build matrix cannot do (those runners are all
+  # x86_64 Linux, so every entry would exercise the same detection path).
+  verify-installers:
+    name: install (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Which shell each runner is responsible for. fish is native to Unix
+          # and macOS but is not part of the Windows images; PowerShell is the
+          # reverse. Splitting them this way means every shell is exercised
+          # exactly where it is actually used, and none of the runners carry an
+          # interpreter they will never run.
+          - name: macos-arm64
+            os: macos-latest
+            shells: bash fish
+          - name: windows
+            os: windows-latest
+            shells: bash powershell
+          - name: ubuntu
+            os: ubuntu-latest
+            shells: bash fish
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
       - name: Install eish
         run: cargo install --path . --features cli
 
+      - name: Install fish
+        if: contains(matrix.shells, 'fish')
+        run: |
+          case "$(uname -s)" in
+            Linux)
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq fish
+              ;;
+            Darwin)
+              brew install fish
+              ;;
+            *)
+              echo "::error::fish is only supported on Unix and macOS runners"
+              exit 1
+              ;;
+          esac
+          fish --version
+
       - name: Generate and run installers
+        env:
+          SHELLS: ${{ matrix.shells }}
         run: |
           repos=(
             easy-install/easy-install
@@ -66,57 +121,126 @@ jobs:
             quickjs-ng/quickjs
           )
 
+          # PowerShell is only exercised on Windows, where both interpreters
+          # are present: `pwsh` (PowerShell 7+) and `powershell` (5.1). The
+          # template has separate paths for each — TLS 1.2, `UseBasicParsing`
+          # and the `$PSEdition` checks only apply to 5.1 — so run both rather
+          # than letting the newer one stand in for the older.
+          ps_bins=()
+          case " $SHELLS " in
+            *" powershell "*)
+              for candidate in pwsh powershell; do
+                if command -v "$candidate" >/dev/null 2>&1; then
+                  ps_bins+=("$candidate")
+                fi
+              done
+              if [ ${#ps_bins[@]} -eq 0 ]; then
+                echo "::error::no PowerShell interpreter found (tried pwsh, powershell)"
+                exit 1
+              fi
+              echo "PowerShell interpreters: ${ps_bins[*]}"
+              ;;
+          esac
+
           mkdir -p target/verify
           failed=0
+          checks=0
+
+          # Run one installer and require it to leave an executable behind.
+          # Exiting 0 without installing anything is the failure this job
+          # exists to catch, so the directory is checked rather than just the
+          # exit status.
+          verify() {
+            local label="$1" dir="$2"
+            shift 2
+
+            checks=$((checks + 1))
+            rm -rf "$dir"
+            mkdir -p "$dir"
+
+            echo "::group::$label"
+
+            if ! "$@"; then
+              echo "::error::$label: the installer failed"
+              failed=1
+            else
+              # `-type f -print -quit` rather than `| head`, which would trip
+              # the workflow's `pipefail` through SIGPIPE.
+              local installed
+              installed="$(find "$dir" -maxdepth 1 -type f -print -quit || true)"
+              if [ -z "$installed" ] || [ ! -x "$installed" ]; then
+                echo "::error::$label: no executable was installed into $dir"
+                find "$dir" -maxdepth 1 -print || true
+                failed=1
+              else
+                echo "installed $installed"
+              fi
+            fi
+
+            echo "::endgroup::"
+          }
 
           for repo in "${repos[@]}"; do
             name="${repo##*/}"
-            script="target/verify/$name.sh"
-            dir="$PWD/target/verify/$name"
-            mkdir -p "$dir"
+            base="target/verify/$name"
 
-            echo "::group::$repo"
+            echo "##### $repo on $(uname -s)/$(uname -m), shells: $SHELLS"
 
-            if ! eish "$repo" --shell bash -o "$script"; then
-              echo "::error::$repo: could not generate the installer"
-              failed=1
-              echo "::endgroup::"
-              continue
-            fi
+            for shell in $SHELLS; do
+              # PowerShell refuses to run a script that does not end in `.ps1`,
+              # so the file name cannot just be `<repo>.<shell>`.
+              case "$shell" in
+                bash) ext=sh ;;
+                fish) ext=fish ;;
+                powershell) ext=ps1 ;;
+              esac
+              script="$base.$ext"
 
-            if ! bash -n "$script"; then
-              echo "::error::$repo: the generated script is not valid bash"
-              failed=1
-              echo "::endgroup::"
-              continue
-            fi
+              if ! eish "$repo" --shell "$shell" -o "$script"; then
+                echo "::error::$repo: could not generate the $shell installer"
+                failed=1
+                continue
+              fi
 
-            echo "--- platform table ---"
-            sed -n '/^platform_filename()/,/^}/p' "$script"
+              case "$shell" in
+                bash)
+                  if ! bash -n "$script"; then
+                    echo "::error::$repo: the generated bash is not valid"
+                    failed=1
+                    continue
+                  fi
+                  dir="$PWD/$base-bash"
+                  verify "$repo/bash" "$dir" \
+                    env EI_DIR="$dir" EI_MIN_DISK_SPACE=0 bash "$script"
+                  ;;
 
-            if ! EI_DIR="$dir" EI_MIN_DISK_SPACE=0 bash "$script"; then
-              echo "::error::$repo: the installer failed"
-              failed=1
-              echo "::endgroup::"
-              continue
-            fi
+                fish)
+                  if ! fish -n "$script"; then
+                    echo "::error::$repo: the generated fish is not valid"
+                    failed=1
+                    continue
+                  fi
+                  dir="$PWD/$base-fish"
+                  verify "$repo/fish" "$dir" \
+                    env EI_DIR="$dir" EI_MIN_DISK_SPACE=0 fish "$script"
+                  ;;
 
-            echo "--- installed ---"
-            ls -l "$dir"
-
-            # An empty directory means the installer exited cleanly without
-            # producing a binary, which is the failure mode this job exists to
-            # catch.
-            installed="$(find "$dir" -maxdepth 1 -type f -perm -u+x | head -n 1)"
-            if [ -z "$installed" ]; then
-              echo "::error::$repo: the installer produced no executable"
-              failed=1
-              echo "::endgroup::"
-              continue
-            fi
-
-            echo "installed $installed"
-            echo "::endgroup::"
+                powershell)
+                  for ps in "${ps_bins[@]}"; do
+                    dir="$PWD/$base-$ps"
+                    if [ "$ps" = powershell ]; then
+                      args=(-NoProfile -ExecutionPolicy Bypass -File)
+                    else
+                      args=(-NoProfile -File)
+                    fi
+                    verify "$repo/$ps" "$dir" \
+                      env EI_DIR="$dir" EI_MIN_DISK_SPACE=0 \
+                      "$ps" "${args[@]}" "$script"
+                  done
+                  ;;
+              esac
+            done
           done
 
+          echo "ran $checks installer checks"
           exit "$failed"
