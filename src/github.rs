@@ -315,8 +315,14 @@ mod tests {
             Some(&Token::new("t", Source::Flag)),
             ureq::Error::StatusCode(403),
         );
-        assert!(!authenticated.to_string().contains("rate limit"), "{authenticated}");
-        assert!(authenticated.to_string().contains("--token"), "{authenticated}");
+        assert!(
+            !authenticated.to_string().contains("rate limit"),
+            "{authenticated}"
+        );
+        assert!(
+            authenticated.to_string().contains("--token"),
+            "{authenticated}"
+        );
 
         // The hint names the helper that supplied the token.
         let from_gh = map_request_error(

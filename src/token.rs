@@ -140,7 +140,11 @@ impl Token {
         static CACHE: OnceLock<Option<Token>> = OnceLock::new();
 
         CACHE
-            .get_or_init(|| Self::from_env().or_else(Self::from_gh_cli).or_else(Self::from_git_credential))
+            .get_or_init(|| {
+                Self::from_env()
+                    .or_else(Self::from_gh_cli)
+                    .or_else(Self::from_git_credential)
+            })
             .as_ref()
     }
 
@@ -164,7 +168,8 @@ impl Token {
     /// party.
     pub fn may_send_to(&self, api_base: &str) -> bool {
         !self.source.is_discovered()
-            || host_of(api_base).is_some_and(|host| host == "github.com" || host.ends_with(".github.com"))
+            || host_of(api_base)
+                .is_some_and(|host| host == "github.com" || host.ends_with(".github.com"))
     }
 
     /// Normalise a candidate value, rejecting blanks.
@@ -258,17 +263,26 @@ mod tests {
     #[test]
     fn parses_git_credential_output() {
         let output = "protocol=https\nhost=github.com\nusername=octocat\npassword=gho_secret\n\n";
-        assert_eq!(parse_credential_output(output).as_deref(), Some("gho_secret"));
+        assert_eq!(
+            parse_credential_output(output).as_deref(),
+            Some("gho_secret")
+        );
 
         // CRLF, as produced on Windows.
         let output = "protocol=https\r\nhost=github.com\r\npassword=gho_secret\r\n";
-        assert_eq!(parse_credential_output(output).as_deref(), Some("gho_secret"));
+        assert_eq!(
+            parse_credential_output(output).as_deref(),
+            Some("gho_secret")
+        );
     }
 
     #[test]
     fn ignores_output_without_a_password() {
         assert_eq!(parse_credential_output(""), None);
-        assert_eq!(parse_credential_output("protocol=https\nhost=github.com\n"), None);
+        assert_eq!(
+            parse_credential_output("protocol=https\nhost=github.com\n"),
+            None
+        );
         // A helper that reports an empty password is not usable.
         assert_eq!(parse_credential_output("password=\n"), None);
         // Only the `password` key counts, not a lookalike.
@@ -285,10 +299,19 @@ mod tests {
 
     #[test]
     fn parses_url_hosts() {
-        assert_eq!(host_of("https://api.github.com/repos/x/y"), Some("api.github.com"));
+        assert_eq!(
+            host_of("https://api.github.com/repos/x/y"),
+            Some("api.github.com")
+        );
         assert_eq!(host_of("https://github.com"), Some("github.com"));
-        assert_eq!(host_of("https://user:pw@github.com:443/x"), Some("github.com"));
-        assert_eq!(host_of("http://ghe.corp.example/api/v3"), Some("ghe.corp.example"));
+        assert_eq!(
+            host_of("https://user:pw@github.com:443/x"),
+            Some("github.com")
+        );
+        assert_eq!(
+            host_of("http://ghe.corp.example/api/v3"),
+            Some("ghe.corp.example")
+        );
         assert_eq!(host_of("not a url"), None);
     }
 

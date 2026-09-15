@@ -21,7 +21,7 @@
 
 use std::str::FromStr;
 
-use guess_target::{Abi, GuessTarget, Target};
+use guess_target::{Abi, Arch, GuessTarget, Target};
 
 /// Rust target triples the generated installers can detect at runtime.
 ///
@@ -112,9 +112,75 @@ pub fn is_installable_asset(file_name: &str) -> bool {
     !lower.contains('.')
 }
 
-/// Minimum `guess_target` rank a match needs before it is trusted.
+/// Architecture aliases found in release names, mapped to the architecture they
+/// denote.
 ///
-/// Upstream's scale is roughly:
+/// The spelling is deliberately asymmetric: `x86` maps to [`Arch::I686`] even
+/// though upstream also accepts it as a synonym for [`Arch::X86_64`], because a
+/// file called `qjs-linux-x86` is a 32-bit build. Mapping an alias to the most
+/// specific architecture it can denote is what makes [`arch_precision`] able to
+/// tell `qjs-linux-x86` and `qjs-linux-x86_64` apart.
+///
+/// ```
+/// use eish::target::arch_precision;
+///
+/// // The 64-bit name names the 64-bit architecture; the other does not.
+/// assert!(arch_precision("qjs-linux-x86_64", "x86_64-unknown-linux-gnu") == 6);
+/// assert!(arch_precision("qjs-linux-x86", "x86_64-unknown-linux-gnu") == 0);
+/// // …and the reverse for the 32-bit architecture.
+/// assert!(arch_precision("qjs-linux-x86", "i686-unknown-linux-gnu") == 3);
+/// assert!(arch_precision("qjs-linux-x86_64", "i686-unknown-linux-gnu") == 0);
+/// ```
+pub fn arch_precision(file_name: &str, target: &str) -> usize {
+    let Ok(target) = Target::from_str(target) else {
+        return 0;
+    };
+    let arch = target.arch();
+
+    let lower = file_name.to_ascii_lowercase();
+    // The *longest* alias present decides which architecture the name is
+    // talking about, so `x86_64` is not read as an `x86` build.
+    match ALIASES
+        .iter()
+        .filter(|(alias, _)| lower.contains(alias))
+        .max_by_key(|(alias, _)| alias.len())
+    {
+        Some((alias, a)) if *a == arch => alias.len(),
+        _ => 0,
+    }
+}
+
+/// See [`arch_precision`].
+const ALIASES: &[(&str, Arch)] = &[
+    ("x86_64", Arch::X86_64),
+    ("x86-64", Arch::X86_64),
+    ("amd64", Arch::X86_64),
+    ("x64", Arch::X86_64),
+    ("i686", Arch::I686),
+    ("i386", Arch::I686),
+    ("ia32", Arch::I686),
+    ("386", Arch::I686),
+    ("x86", Arch::I686),
+    ("aarch64", Arch::Aarch64),
+    ("arm64", Arch::Aarch64),
+    ("armv8", Arch::Aarch64),
+    ("armv7l", Arch::Armv7),
+    ("armv7", Arch::Armv7),
+    ("armhf", Arch::Armv7),
+    ("armv6", Arch::Arm),
+    ("armel", Arch::Arm),
+    ("arm", Arch::Arm),
+    ("riscv64gc", Arch::Riscv64gc),
+    ("riscv64", Arch::Riscv64gc),
+    ("loongarch64", Arch::Loongarch64),
+    ("powerpc64le", Arch::Powerpc64le),
+    ("ppc64le", Arch::Powerpc64le),
+    ("powerpc64", Arch::Powerpc64),
+    ("ppc64", Arch::Powerpc64),
+    ("s390x", Arch::S390x),
+];
+
+/// Minimum `guess_target` rank a match needs before it is trusted.
 ///
 /// | rank | meaning                                              |
 /// | ---- | ---------------------------------------------------- |
@@ -185,6 +251,12 @@ pub fn rank_for(file_name: &str, target: &str) -> u32 {
 /// first file, which keeps the choice stable across runs. Matches below
 /// `min_rank` are ignored — see [`MIN_RANK`].
 ///
+/// Rank alone is not always decisive. Upstream accepts `x86` as a synonym for
+/// both `i686` and `x86_64`, so `qjs-linux-x86` and `qjs-linux-x86_64` score
+/// equally for an x86_64 target and the wrong (32-bit) file would win on release
+/// order. Ties are therefore broken by [`arch_precision`], which prefers the
+/// name that spells the architecture out.
+///
 /// ```
 /// use eish::target::{best_asset, MIN_RANK};
 ///
@@ -199,21 +271,37 @@ pub fn rank_for(file_name: &str, target: &str) -> u32 {
 ///     best_asset(files, "aarch64-pc-windows-msvc", MIN_RANK).unwrap().0,
 ///     "jq-windows-arm64.exe"
 /// );
+///
+/// // The 64-bit build wins even though it is listed after the 32-bit one.
+/// let files = ["qjs-linux-x86", "qjs-linux-x86_64"];
+/// assert_eq!(
+///     best_asset(files, "x86_64-unknown-linux-gnu", MIN_RANK).unwrap().0,
+///     "qjs-linux-x86_64"
+/// );
+/// assert_eq!(
+///     best_asset(files, "i686-unknown-linux-gnu", MIN_RANK).unwrap().0,
+///     "qjs-linux-x86"
+/// );
 /// ```
 pub fn best_asset<'a, I>(files: I, target: &str, min_rank: u32) -> Option<(&'a str, u32)>
 where
     I: IntoIterator<Item = &'a str>,
 {
-    let mut best: Option<(&'a str, u32)> = None;
+    let mut best: Option<(&'a str, u32, usize)> = None;
 
     for file in files {
         let rank = rank_for(file, target);
-        if rank >= min_rank && best.is_none_or(|(_, best_rank)| rank > best_rank) {
-            best = Some((file, rank));
+        if rank < min_rank {
+            continue;
+        }
+
+        let score = (rank, arch_precision(file, target));
+        if best.is_none_or(|(_, best_rank, best_precision)| score > (best_rank, best_precision)) {
+            best = Some((file, rank, score.1));
         }
     }
 
-    best
+    best.map(|(file, rank, _)| (file, rank))
 }
 
 /// The most likely target for an asset.
@@ -568,6 +656,79 @@ mod tests {
                 .0,
             "tool-x86_64-unknown-linux-musl.zip"
         );
+    }
+
+    #[test]
+    fn prefers_the_name_that_spells_out_the_architecture() {
+        // `x86` is an alias for both i686 and x86_64 upstream, so these two
+        // files score equally for an x86_64 target. Without a tie-break the
+        // 32-bit build wins on release order, which is a silent
+        // "exec format error" for the user.
+        let files = ["qjs-linux-x86", "qjs-linux-x86_64"];
+        assert_eq!(
+            best_asset(files, "x86_64-unknown-linux-gnu", MIN_RANK)
+                .unwrap()
+                .0,
+            "qjs-linux-x86_64"
+        );
+        assert_eq!(
+            best_asset(files, "i686-unknown-linux-gnu", MIN_RANK)
+                .unwrap()
+                .0,
+            "qjs-linux-x86"
+        );
+
+        // The same ambiguity exists on Windows.
+        let files = ["qjs-windows-x86.exe", "qjs-windows-x86_64.exe"];
+        assert_eq!(
+            best_asset(files, "x86_64-pc-windows-msvc", MIN_RANK)
+                .unwrap()
+                .0,
+            "qjs-windows-x86_64.exe"
+        );
+        assert_eq!(
+            best_asset(files, "i686-pc-windows-msvc", MIN_RANK)
+                .unwrap()
+                .0,
+            "qjs-windows-x86.exe"
+        );
+
+        // `arm64` and `armv8` are the spelled-out AArch64 names.
+        let files = ["tool-linux-arm", "tool-linux-arm64"];
+        assert_eq!(
+            best_asset(files, "aarch64-unknown-linux-gnu", MIN_RANK)
+                .unwrap()
+                .0,
+            "tool-linux-arm64"
+        );
+        assert_eq!(
+            best_asset(files, "arm-unknown-linux-gnueabihf", MIN_RANK)
+                .unwrap()
+                .0,
+            "tool-linux-arm"
+        );
+    }
+
+    #[test]
+    fn arch_precision_reads_the_longest_alias() {
+        // `x86_64` contains `x86`, but the longer alias decides.
+        assert!(arch_precision("qjs-linux-x86_64", "x86_64-unknown-linux-gnu") > 0);
+        assert_eq!(
+            arch_precision("qjs-linux-x86", "x86_64-unknown-linux-gnu"),
+            0
+        );
+        assert!(arch_precision("qjs-linux-x86", "i686-unknown-linux-gnu") > 0);
+
+        // `arm64` contains `arm`.
+        assert_eq!(
+            arch_precision("tool-arm64", "arm-unknown-linux-gnueabihf"),
+            0
+        );
+        assert!(arch_precision("tool-arm64", "aarch64-unknown-linux-gnu") > 0);
+        assert!(arch_precision("tool-arm", "arm-unknown-linux-gnueabihf") > 0);
+
+        // A name with no architecture at all scores nothing.
+        assert_eq!(arch_precision("tool-linux", "x86_64-unknown-linux-gnu"), 0);
     }
 
     #[test]

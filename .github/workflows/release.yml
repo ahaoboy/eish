@@ -52,3 +52,71 @@ jobs:
           tag: nightly
           allowUpdates: true
           features: cli
+
+      - name: Install eish
+        run: cargo install --path . --features cli
+
+      - name: Generate and run installers
+        run: |
+          repos=(
+            easy-install/easy-install
+            boa-dev/boa
+            theMackabu/ant
+            ahaoboy/es5
+            quickjs-ng/quickjs
+          )
+
+          mkdir -p target/verify
+          failed=0
+
+          for repo in "${repos[@]}"; do
+            name="${repo##*/}"
+            script="target/verify/$name.sh"
+            dir="$PWD/target/verify/$name"
+            mkdir -p "$dir"
+
+            echo "::group::$repo"
+
+            if ! eish "$repo" --shell bash -o "$script"; then
+              echo "::error::$repo: could not generate the installer"
+              failed=1
+              echo "::endgroup::"
+              continue
+            fi
+
+            if ! bash -n "$script"; then
+              echo "::error::$repo: the generated script is not valid bash"
+              failed=1
+              echo "::endgroup::"
+              continue
+            fi
+
+            echo "--- platform table ---"
+            sed -n '/^platform_filename()/,/^}/p' "$script"
+
+            if ! EI_DIR="$dir" EI_MIN_DISK_SPACE=0 bash "$script"; then
+              echo "::error::$repo: the installer failed"
+              failed=1
+              echo "::endgroup::"
+              continue
+            fi
+
+            echo "--- installed ---"
+            ls -l "$dir"
+
+            # An empty directory means the installer exited cleanly without
+            # producing a binary, which is the failure mode this job exists to
+            # catch.
+            installed="$(find "$dir" -maxdepth 1 -type f -perm -u+x | head -n 1)"
+            if [ -z "$installed" ]; then
+              echo "::error::$repo: the installer produced no executable"
+              failed=1
+              echo "::endgroup::"
+              continue
+            fi
+
+            echo "installed $installed"
+            echo "::endgroup::"
+          done
+
+          exit "$failed"

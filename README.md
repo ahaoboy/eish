@@ -56,7 +56,21 @@ eish owner/repo --asset tool-linux-amd64 --asset tool-macos-arm64 > install.sh
 eish owner/repo@v1.2.3 | bash
 ```
 
-### Library
+### Credentials
+
+GitHub allows 60 anonymous API requests per hour per IP, which is easy to
+exhaust. `eish` looks for credentials rather than failing, in this order:
+
+1. `--token`
+2. `GITHUB_TOKEN` or `GH_TOKEN`
+3. `gh auth token` (GitHub CLI)
+4. `git credential fill` (Git Credential Manager)
+
+It reports which one it used, so a later `403` is easy to attribute. Tokens
+found by `gh` or `git` are only ever sent to github.com; tokens you supply
+explicitly also go to a custom `--api-base`.
+
+## Library
 
 ```rust
 use eish::{Client, InstallSpec, Proxy, Shell};
@@ -68,6 +82,13 @@ let mut spec = InstallSpec::new("easy-install", "easy-install")
 let release = Client::new().release("easy-install", "easy-install", None)?;
 spec.apply_release_checked(&release)?;
 std::fs::write("install.sh", spec.render()?)?;
+```
+
+The `cli` feature (on by default) builds the binary and pulls in `clap`. For the
+library alone:
+
+```toml
+eish = { version = "0.1", default-features = false }
 ```
 
 ## What the generated scripts do
