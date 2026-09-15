@@ -40,6 +40,15 @@
 //! eish owner/repo@v1.0.0 > install.sh
 //! eish owner/repo --shell powershell > install.ps1
 //! ```
+//!
+//! # Features
+//!
+//! * `cli` *(default)* — builds the `eish` binary and pulls in `clap`. Turn it
+//!   off to depend on the library alone:
+//!
+//!   ```toml
+//!   eish = { version = "0.1", default-features = false }
+//!   ```
 
 #![warn(missing_docs)]
 #![warn(missing_debug_implementations)]

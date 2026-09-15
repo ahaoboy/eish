@@ -9,8 +9,20 @@ keywords = ["installer", "shell", "script", "github", "release"]
 categories = ["command-line-utilities", "development-tools"]
 repository = "https://github.com/easy-install/eish"
 
+[features]
+default = ["cli"]
+
+# The `eish` binary. Disable it (with --no-default-features) to build only the
+# library, which drops the `clap` dependency entirely.
+cli = ["dep:clap"]
+
+[[bin]]
+name = "eish"
+path = "src/main.rs"
+required-features = ["cli"]
+
 [dependencies]
-clap = { version = "4", features = ["derive", "env"] }
+clap = { version = "4", features = ["derive"], optional = true }
 guess-target = { git = "https://github.com/ahaoboy/guess-target.git", version = "0.1", features = ["serde"] }
 minijinja = { version = "2", features = ["custom_syntax"] }
 serde = { version = "1", features = ["derive"] }

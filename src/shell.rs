@@ -88,8 +88,9 @@ impl FromStr for Shell {
     }
 }
 
-// `clap` is a hard dependency of this crate, and deriving the CLI help from the
-// same metadata keeps `--help` and the error messages from drifting apart.
+// Deriving the CLI help from the same metadata keeps `--help` and the error
+// messages from drifting apart. Only the binary needs it.
+#[cfg(feature = "cli")]
 impl clap::ValueEnum for Shell {
     fn value_variants<'a>() -> &'a [Self] {
         &Shell::ALL
