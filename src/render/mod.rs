@@ -57,8 +57,26 @@ struct Context<'a> {
     targets: Vec<&'a str>,
     /// Detected triple -> compatible triples that this release ships.
     fallbacks: Vec<Fallback<'a>>,
+    /// Asset file name -> the triples it can be installed as, sorted.
+    ///
+    /// Used by `--file`: the file name is the only thing an offline install has
+    /// to go on, and several triples can legitimately share one file (a
+    /// release that ships a single `tool-windows-x64.zip` serves both the msvc
+    /// and the gnu target).
+    asset_groups: Vec<AssetGroup<'a>>,
+    /// Every distinct asset file name, sorted; for error messages.
+    filenames: Vec<&'a str>,
     /// Version of `eish` that produced the script.
     eish_version: &'static str,
+}
+
+/// Every triple that can be installed from one asset file.
+#[derive(Debug, Serialize)]
+struct AssetGroup<'a> {
+    /// File name as it appears in the release.
+    filename: &'a str,
+    /// Triples whose entry in the asset table is this file.
+    targets: Vec<&'a str>,
 }
 
 /// One entry of the generated fallback table.
@@ -75,6 +93,8 @@ impl<'a> Context<'a> {
         let mut assets: Vec<_> = spec.assets.iter().collect();
         assets.sort_by(|a, b| a.target.cmp(&b.target));
         let targets = assets.iter().map(|asset| asset.target.as_str()).collect();
+        let asset_groups = build_asset_groups(spec);
+        let filenames = asset_groups.iter().map(|group| group.filename).collect();
 
         Self {
             slug,
@@ -91,11 +111,36 @@ impl<'a> Context<'a> {
             min_disk_space_mb: spec.min_disk_space_mb,
             default_target: spec.default_target.as_deref().unwrap_or(""),
             fallbacks: build_fallbacks(spec),
+            asset_groups,
+            filenames,
             targets,
             assets,
             eish_version: env!("CARGO_PKG_VERSION"),
         }
     }
+}
+
+/// Invert the asset table: one entry per distinct file name, listing the
+/// triples it serves.
+///
+/// The table is ordered by target, so consecutive entries sharing a file name
+/// collapse into one group. Both the outer list and each inner list come out
+/// sorted, which keeps the generated `case` statements stable.
+fn build_asset_groups(spec: &InstallSpec) -> Vec<AssetGroup<'_>> {
+    let mut groups: Vec<AssetGroup<'_>> = Vec::new();
+
+    for asset in &spec.assets {
+        match groups.iter_mut().find(|g| g.filename == asset.filename) {
+            Some(group) => group.targets.push(&asset.target),
+            None => groups.push(AssetGroup {
+                filename: &asset.filename,
+                targets: vec![&asset.target],
+            }),
+        }
+    }
+
+    groups.sort_by(|a, b| a.filename.cmp(b.filename));
+    groups
 }
 
 /// Build the runtime fallback table.

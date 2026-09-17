@@ -25,8 +25,15 @@ EI_REF="${EI_REF:-<{ resource_ref }>}"
 EI_TARGET="${EI_TARGET:-<{ default_target }>}"
 EI_MIN_DISK_SPACE="${EI_MIN_DISK_SPACE:-<{ min_disk_space_mb }>}"
 
+# Path to an already-downloaded asset, for an offline install. When set, the
+# file name decides which target is installed and nothing is downloaded.
+EI_FILE="${EI_FILE:-}"
+
 # Target triples bundled in this installer, space separated.
 EI_SUPPORTED_TARGETS='<{ targets | join(" ") }>'
+
+# Asset file names bundled in this installer, space separated.
+EI_SUPPORTED_ASSETS='<{ filenames | join(" ") }>'
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -58,11 +65,13 @@ Options:
   --target <triple>  force a Rust target triple instead of auto-detection
   --type <type>      resource type: release|file (default: $EI_TYPE)
   --ref <reference>  branch/tag/commit used by --type file (default: $EI_REF)
+  --file <path>      install from a local file instead of downloading;
+                     its name must match a release asset
   --list             list the target triples this installer knows
   -h, --help         show this help
 
 Environment variables mirror the options above:
-  EI_PROXY EI_TAG EI_DIR EI_TARGET EI_TYPE EI_REF EI_MIN_DISK_SPACE
+  EI_PROXY EI_TAG EI_DIR EI_TARGET EI_TYPE EI_REF EI_MIN_DISK_SPACE EI_FILE
 
 Supported targets:
 $(printf '  %s\n' $EI_SUPPORTED_TARGETS)
@@ -84,6 +93,19 @@ platform_filename() {
 platform_fallbacks() {
     case "$1" in<% for fallback in fallbacks %>
         '<{ fallback.target }>') echo '<{ fallback.alternatives | join(" ") }>' ;;
+<%- endfor %>
+        *) echo '' ;;
+    esac
+}
+
+# Targets that can be installed from a given asset file name.
+#
+# Several targets may share one file — a release that ships a single
+# `tool-windows-x64.zip` serves both the msvc and the gnu target — so this
+# returns them all and the caller picks.
+platform_targets_for_asset() {
+    case "$1" in<% for group in asset_groups %>
+        '<{ group.filename }>') echo '<{ group.targets | join(" ") }>' ;;
 <%- endfor %>
         *) echo '' ;;
     esac
@@ -185,9 +207,14 @@ detect_platform() {
     esac
 }
 
-# Resolve the target triple to install, honouring EI_TARGET and falling back to
-# a compatible build when the exact one was not published.
+# Resolve the target triple to install, honouring EI_FILE and EI_TARGET, and
+# falling back to a compatible build when the exact one was not published.
 resolve_target() {
+    if [ -n "$EI_FILE" ]; then
+        resolve_target_from_file
+        return 0
+    fi
+
     ei_primary="$EI_TARGET"
     if [ -z "$ei_primary" ]; then
         ei_primary="$(detect_platform)"
@@ -208,6 +235,40 @@ resolve_target() {
         fi
     done
     echo ''
+}
+
+# Pick the target to install from the name of a local file.
+#
+# The file name is the only thing an offline install has to go on, so it has to
+# be one of the release's assets; anything else is a typo or the wrong file
+# entirely. When several targets share that file the machine's own platform
+# decides, and only if it is not among them does the first one win.
+resolve_target_from_file() {
+    ei_name="$(basename "$EI_FILE")"
+    ei_matches="$(platform_targets_for_asset "$ei_name")"
+
+    if [ -z "$ei_matches" ]; then
+        log "known assets: $EI_SUPPORTED_ASSETS"
+        die "$ei_name is not an asset of $EI_OWNER/$EI_REPO (see the list above)"
+    fi
+
+    if [ -n "$EI_TARGET" ]; then
+        case " $ei_matches " in
+            *" $EI_TARGET "*) echo "$EI_TARGET"; return 0 ;;
+            *) die "$ei_name is for $ei_matches, not $EI_TARGET" ;;
+        esac
+    fi
+
+    ei_detected="$(detect_platform)"
+    case " $ei_matches " in
+        *" $ei_detected "*) echo "$ei_detected"; return 0 ;;
+    esac
+
+    for ei_candidate in $ei_matches; do
+        log "installing $ei_name for $ei_candidate (detected $ei_detected)"
+        echo "$ei_candidate"
+        return 0
+    done
 }
 
 # ---------------------------------------------------------------------------
@@ -461,6 +522,7 @@ parse_args() {
             --target) [ $# -ge 2 ] || die '--target requires a value'; EI_TARGET="$2"; shift 2 ;;
             --type)   [ $# -ge 2 ] || die '--type requires a value';   EI_TYPE="$2";   shift 2 ;;
             --ref)    [ $# -ge 2 ] || die '--ref requires a value';    EI_REF="$2";    shift 2 ;;
+            --file)   [ $# -ge 2 ] || die '--file requires a value';   EI_FILE="$2";   shift 2 ;;
             --list)   EI_LIST=1; shift ;;
             -h|--help) usage; exit 0 ;;
             *) die "unknown argument: $1 (try --help)" ;;
@@ -482,9 +544,17 @@ validate_config() {
     if [ "$EI_TYPE" = release ]; then
         case "$EI_PROXY" in
             jsdelivr|statically)
-                die "the $EI_PROXY proxy cannot serve release assets; use --proxy github or --type file"
+                # Only worth complaining about when something will actually be
+                # downloaded: an offline install never builds a URL.
+                if [ -z "$EI_FILE" ]; then
+                    die "the $EI_PROXY proxy cannot serve release assets; use --proxy github or --type file"
+                fi
                 ;;
         esac
+    fi
+
+    if [ -n "$EI_FILE" ] && [ ! -f "$EI_FILE" ]; then
+        die "no such file: $EI_FILE"
     fi
 }
 
@@ -510,7 +580,11 @@ main() {
     ei_filename="$(platform_filename "$ei_target")"
     ei_install_dir="$(resolve_install_dir)"
 
-    log "installing $EI_BINARY_NAME ($ei_target) into $ei_install_dir"
+    if [ -n "$EI_FILE" ]; then
+        log "installing $EI_BINARY_NAME ($ei_target) from $EI_FILE"
+    else
+        log "installing $EI_BINARY_NAME ($ei_target) into $ei_install_dir"
+    fi
 
     check_disk_space "$ei_install_dir"
 
@@ -518,8 +592,15 @@ main() {
     mkdir -p "$ei_tmp"
     trap 'rm -rf "$ei_tmp"' EXIT INT TERM
 
-    download "$(download_url "$ei_filename")" "$ei_tmp/$ei_filename"
-    extract "$ei_tmp/$ei_filename" "$ei_tmp" "$ei_filename"
+    if [ -n "$EI_FILE" ]; then
+        # The file is used where it lies, so it is never copied or deleted.
+        ei_archive="$EI_FILE"
+    else
+        ei_archive="$ei_tmp/$ei_filename"
+        download "$(download_url "$ei_filename")" "$ei_archive"
+    fi
+
+    extract "$ei_archive" "$ei_tmp" "$ei_filename"
 
     ei_binary="$(find_binary "$ei_tmp")" || die "could not find $EI_BINARY_NAME inside $ei_filename"
 

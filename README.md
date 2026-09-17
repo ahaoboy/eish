@@ -47,7 +47,7 @@ A few more examples:
 
 ```sh
 # Which platforms would be supported?
-eish jqlang/jq --list
+eish quickjs-ng/quickjs --list
 
 # Generate without touching the network at all
 eish owner/repo --asset tool-linux-amd64 --asset tool-macos-arm64 > install.sh
@@ -55,6 +55,39 @@ eish owner/repo --asset tool-linux-amd64 --asset tool-macos-arm64 > install.sh
 # Pipe straight into a shell
 eish owner/repo@v1.2.3 | bash
 ```
+
+### Offline installs
+
+The generated script can install from a file you already have, which is what
+makes it usable on a machine with no network access. Download the asset once
+while online:
+
+```sh
+curl -LO https://github.com/quickjs-ng/quickjs/releases/latest/download/qjs-linux-x86_64
+```
+
+The file name must match an asset of the release — that name is the only thing
+the installer has to go on, and it is also what decides the target triple. When
+several targets share one file, the machine's own platform picks between them.
+
+```sh
+./install.sh --file ./qjs-linux-x86_64
+```
+
+or:
+
+```sh
+EI_FILE=./qjs-linux-x86_64 ./install.sh
+```
+
+The PowerShell installer uses `-File`:
+
+```powershell
+.\install.ps1 -File .\qjs-windows-x86_64.exe
+```
+
+A file whose name is not an asset is rejected rather than guessed at, and the
+message lists the names that would work.
 
 ### Credentials
 
@@ -101,7 +134,7 @@ eish = { version = "0.1", default-features = false }
 4. Download, unpack, install into `~/.ei` and update `PATH`.
 
 `--help` on any generated script documents its options, and each one has a
-matching environment variable (`EI_DIR`, `EI_PROXY`, `EI_TARGET`, …):
+matching environment variable (`EI_DIR`, `EI_PROXY`, `EI_TARGET`, `EI_FILE`, …):
 
 ```sh
 EI_DIR=/usr/local/bin ./install.sh
@@ -110,7 +143,7 @@ EI_DIR=/usr/local/bin ./install.sh
 ## Supported
 
 Formats: `.tar.gz`, `.tgz`, `.tar.xz`, `.txz`, `.tar.bz2`, `.tbz2`, `.zip`,
-`.gz`, `.exe`, and bare binaries such as `jq-linux-amd64`. Anything else
+`.gz`, `.exe`, and bare binaries such as `qjs-linux-x86_64`. Anything else
 (checksums, `.msi`, `.deb`, `.bsdiff`, …) is ignored.
 
 Targets: Linux (glibc and musl), macOS, Windows, Android and the BSDs, across

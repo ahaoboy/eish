@@ -35,6 +35,12 @@ param(
     # Minimum free disk space, in megabytes (0 disables the check).
     [int]$MinDiskSpace = <{ min_disk_space_mb }>,
 
+    # Install from a local file instead of downloading.
+    #
+    # The file name must match a release asset, which is also what decides the
+    # target triple.
+    [string]$File = '',
+
     # List the target triples this installer knows and exit.
     [switch]$List,
 
@@ -59,12 +65,24 @@ if ($env:EI_TARGET) { $Target = $env:EI_TARGET }
 if ($env:EI_TYPE) { $Type = $env:EI_TYPE }
 if ($env:EI_REF) { $Ref = $env:EI_REF }
 if ($env:EI_MIN_DISK_SPACE) { $MinDiskSpace = [int]$env:EI_MIN_DISK_SPACE }
+if ($env:EI_FILE) { $File = $env:EI_FILE }
 
 # Target triple -> release asset file name.
 $EiAssets = [ordered]@{<% for asset in assets %>
     '<{ asset.target }>' = '<{ asset.filename }>'
 <%- endfor %>
 }
+
+# Asset file name -> the target triples it can be installed as.
+#
+# Several triples may share one file, so the value is a list.
+$EiAssetsByName = @{<% for group in asset_groups %>
+    '<{ group.filename }>' = @(<% for target in group.targets %>, '<{ target }>'<% endfor %>)
+<%- endfor %>
+}
+
+# Every distinct asset file name, for error messages.
+$EiAssetNames = @(<% for filename in filenames %>, '<{ filename }>'<% endfor %>)
 
 $EiTemp = $null
 
@@ -153,6 +171,8 @@ function Get-EiPlatform {
 }
 
 function Resolve-EiTarget {
+    if ($File) { return Resolve-EiTargetFromFile }
+
     $primary = $Target
     if (-not $primary) { $primary = Get-EiPlatform }
     if (-not $primary) { return $null }
@@ -167,6 +187,34 @@ function Resolve-EiTarget {
     return $null
 }
 
+# Pick the target to install from the name of a local file.
+#
+# The file name is the only thing an offline install has to go on, so it has to
+# be one of the release's assets. When several targets share that file the
+# machine's own platform decides, and only if it is not among them does the
+# first one win.
+function Resolve-EiTargetFromFile {
+    $name = Split-Path -Path $File -Leaf
+    $matches = @()
+    if ($EiAssetsByName.ContainsKey($name)) { $matches = @($EiAssetsByName[$name]) }
+
+    if ($matches.Count -eq 0) {
+        Write-EiLog "known assets: $($EiAssetNames -join ' ')"
+        throw "$name is not an asset of $EiOwner/$EiRepo (see the list above)"
+    }
+
+    if ($Target) {
+        if ($matches -contains $Target) { return $Target }
+        throw "$name is for $($matches -join ' '), not $Target"
+    }
+
+    $detected = Get-EiPlatform
+    if ($matches -contains $detected) { return $detected }
+
+    Write-EiLog "installing $name for $($matches[0]) (detected $detected)"
+    return $matches[0]
+}
+
 function Expand-EiPath {
     param([string]$Path)
     if ($Path -eq '~') { return $HOME }
@@ -177,32 +225,32 @@ function Expand-EiPath {
 }
 
 function Get-EiDownloadUrl {
-    param([string]$File)
+    param([string]$Asset)
     $github = "https://github.com/$EiOwner/$EiRepo"
     $xget = "https://xget.xi-xu.me/gh/$EiOwner/$EiRepo"
 
     if ($Type -eq 'file') {
         switch ($Proxy) {
-            'github'     { return "$github/raw/$Ref/$File" }
-            'gh-proxy'   { return "https://gh-proxy.com/$github/raw/$Ref/$File" }
-            'xget'       { return "$xget/raw/$Ref/$File" }
-            'jsdelivr'   { return "https://cdn.jsdelivr.net/gh/$EiOwner/$EiRepo@$Ref/$File" }
-            'statically' { return "https://cdn.statically.io/gh/$EiOwner/$EiRepo/$Ref/$File" }
+            'github'     { return "$github/raw/$Ref/$Asset" }
+            'gh-proxy'   { return "https://gh-proxy.com/$github/raw/$Ref/$Asset" }
+            'xget'       { return "$xget/raw/$Ref/$Asset" }
+            'jsdelivr'   { return "https://cdn.jsdelivr.net/gh/$EiOwner/$EiRepo@$Ref/$Asset" }
+            'statically' { return "https://cdn.statically.io/gh/$EiOwner/$EiRepo/$Ref/$Asset" }
         }
         return $null
     }
 
     if ($Tag -eq 'latest') {
         switch ($Proxy) {
-            'github'   { return "$github/releases/latest/download/$File" }
-            'gh-proxy' { return "https://gh-proxy.com/$github/releases/latest/download/$File" }
-            'xget'     { return "$xget/releases/latest/download/$File" }
+            'github'   { return "$github/releases/latest/download/$Asset" }
+            'gh-proxy' { return "https://gh-proxy.com/$github/releases/latest/download/$Asset" }
+            'xget'     { return "$xget/releases/latest/download/$Asset" }
         }
     } else {
         switch ($Proxy) {
-            'github'   { return "$github/releases/download/$Tag/$File" }
-            'gh-proxy' { return "https://gh-proxy.com/$github/releases/download/$Tag/$File" }
-            'xget'     { return "$xget/releases/download/$Tag/$File" }
+            'github'   { return "$github/releases/download/$Tag/$Asset" }
+            'gh-proxy' { return "https://gh-proxy.com/$github/releases/download/$Tag/$Asset" }
+            'xget'     { return "$xget/releases/download/$Tag/$Asset" }
         }
     }
     return $null
@@ -380,11 +428,13 @@ Options:
   -Type <type>        resource type: release|file (default: $Type)
   -Ref <reference>    branch/tag/commit used by -Type file (default: $Ref)
   -MinDiskSpace <mb>  minimum free disk space (default: $MinDiskSpace)
+  -File <path>        install from a local file instead of downloading;
+                      its name must match a release asset
   -List               list the target triples this installer knows
   -Help               show this help
 
 Environment variables mirror the options above:
-  EI_PROXY EI_TAG EI_DIR EI_TARGET EI_TYPE EI_REF EI_MIN_DISK_SPACE
+  EI_PROXY EI_TAG EI_DIR EI_TARGET EI_TYPE EI_REF EI_MIN_DISK_SPACE EI_FILE
 
 Supported targets:
 $((($EiAssets.Keys | ForEach-Object { "  $_" }) -join "`n"))
@@ -398,7 +448,15 @@ function Install-EiBinary {
     }
 
     if ($Type -eq 'release' -and $Proxy -in @('jsdelivr', 'statically')) {
-        throw "the $Proxy proxy cannot serve release assets; use -Proxy github or -Type file"
+        # Only worth complaining about when something will actually be
+        # downloaded: an offline install never builds a URL.
+        if (-not $File) {
+            throw "the $Proxy proxy cannot serve release assets; use -Proxy github or -Type file"
+        }
+    }
+
+    if ($File -and -not (Test-Path -LiteralPath $File -PathType Leaf)) {
+        throw "no such file: $File"
     }
 
     $triple = Resolve-EiTarget
@@ -410,22 +468,34 @@ function Install-EiBinary {
         throw "no prebuilt binary for $(Get-EiArch)"
     }
 
-    $file = Get-EiPlatformFilename $triple
+    # PowerShell variable names are case-insensitive, so this must not be called
+    # `$file`: that would silently overwrite the `$File` parameter above and
+    # turn a local install into a download of a bare file name.
+    $asset = Get-EiPlatformFilename $triple
     $installDir = Expand-EiPath $Dir
 
-    Write-EiLog "installing $EiBinary ($triple) into $installDir"
+    if ($File) {
+        Write-EiLog "installing $EiBinary ($triple) from $File"
+    } else {
+        Write-EiLog "installing $EiBinary ($triple) into $installDir"
+    }
     Test-EiDiskSpace $installDir
 
     $script:EiTemp = Join-Path ([System.IO.Path]::GetTempPath()) ("eish-" + [System.Guid]::NewGuid().ToString('n'))
     New-Item -ItemType Directory -Path $EiTemp -Force | Out-Null
 
     try {
-        $archive = Join-Path $EiTemp $file
-        Save-EiDownload (Get-EiDownloadUrl $file) $archive
-        Expand-EiArchive $archive $EiTemp $file
+        # A local file is used where it lies, so it is never copied or deleted.
+        $archive = Join-Path $EiTemp $asset
+        if ($File) {
+            $archive = $File
+        } else {
+            Save-EiDownload (Get-EiDownloadUrl $asset) $archive
+        }
+        Expand-EiArchive $archive $EiTemp $asset
 
         $binary = Find-EiBinary $EiTemp
-        if (-not $binary) { throw "could not find $EiBinary inside $file" }
+        if (-not $binary) { throw "could not find $EiBinary inside $asset" }
 
         New-Item -ItemType Directory -Path $installDir -Force | Out-Null
         $stem = if (Test-EiWindows) { "$EiBinary.exe" } else { $EiBinary }

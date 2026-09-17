@@ -23,9 +23,13 @@ set -q EI_TYPE;           or set -g EI_TYPE '<{ resource_type }>'
 set -q EI_REF;            or set -g EI_REF '<{ resource_ref }>'
 set -q EI_TARGET;         or set -g EI_TARGET '<{ default_target }>'
 set -q EI_MIN_DISK_SPACE; or set -g EI_MIN_DISK_SPACE '<{ min_disk_space_mb }>'
+set -q EI_FILE;           or set -g EI_FILE ''
 
 # Target triples bundled in this installer.
 set -g EI_SUPPORTED_TARGETS <{ targets | join(" ") }>
+
+# Asset file names bundled in this installer.
+set -g EI_SUPPORTED_ASSETS <{ filenames | join(" ") }>
 
 set -g EI_TMP ''
 
@@ -67,11 +71,13 @@ function ei_usage
         '  --target <triple>  force a Rust target triple instead of auto-detection' \
         "  --type <type>      resource type: release|file (default: $EI_TYPE)" \
         "  --ref <reference>  branch/tag/commit used by --type file (default: $EI_REF)" \
+        '  --file <path>      install from a local file instead of downloading;' \
+        '                     its name must match a release asset' \
         '  --list             list the target triples this installer knows' \
         '  -h, --help         show this help' \
         '' \
         'Environment variables mirror the options above:' \
-        '  EI_PROXY EI_TAG EI_DIR EI_TARGET EI_TYPE EI_REF EI_MIN_DISK_SPACE' \
+        '  EI_PROXY EI_TAG EI_DIR EI_TARGET EI_TYPE EI_REF EI_MIN_DISK_SPACE EI_FILE' \
         '' \
         'Supported targets:'
     for target in $EI_SUPPORTED_TARGETS
@@ -97,6 +103,21 @@ function ei_platform_fallbacks
     switch $argv[1]<% for fallback in fallbacks %>
         case '<{ fallback.target }>'
             echo <{ fallback.alternatives | join(" ") }>
+<%- endfor %>
+        case '*'
+            return 1
+    end
+    return 0
+end
+
+# Targets that can be installed from a given asset file name.
+#
+# Several targets may share one file, so this returns them all and the caller
+# picks.
+function ei_platform_targets_for_asset
+    switch $argv[1]<% for group in asset_groups %>
+        case '<{ group.filename }>'
+            echo <{ group.targets | join(" ") }>
 <%- endfor %>
         case '*'
             return 1
@@ -218,9 +239,14 @@ function ei_detect_platform
     end
 end
 
-# Resolve the target triple to install, honouring EI_TARGET and falling back to
-# a compatible build when the exact one was not published.
+# Resolve the target triple to install, honouring EI_FILE and EI_TARGET, and
+# falling back to a compatible build when the exact one was not published.
 function ei_resolve_target
+    if test -n "$EI_FILE"
+        ei_resolve_target_from_file
+        return $status
+    end
+
     set -l primary $EI_TARGET
     if test -z "$primary"
         set primary (ei_detect_platform)
@@ -240,6 +266,40 @@ function ei_resolve_target
         end
     end
     return 1
+end
+
+# Pick the target to install from the name of a local file.
+#
+# The file name is the only thing an offline install has to go on, so it has to
+# be one of the release's assets. When several targets share that file the
+# machine's own platform decides, and only if it is not among them does the
+# first one win.
+function ei_resolve_target_from_file
+    set -l name (basename $EI_FILE)
+    set -l matches (ei_platform_targets_for_asset $name 2>/dev/null)
+
+    if test -z "$matches"
+        ei_log "known assets: $EI_SUPPORTED_ASSETS"
+        ei_die "$name is not an asset of $EI_OWNER/$EI_REPO (see the list above)"
+    end
+
+    if test -n "$EI_TARGET"
+        if contains -- $EI_TARGET $matches
+            echo $EI_TARGET
+            return 0
+        end
+        ei_die "$name is for $matches, not $EI_TARGET"
+    end
+
+    set -l detected (ei_detect_platform)
+    if contains -- $detected $matches
+        echo $detected
+        return 0
+    end
+
+    ei_log "installing $name for $matches[1] (detected $detected)"
+    echo $matches[1]
+    return 0
 end
 
 function ei_is_windows
@@ -452,13 +512,21 @@ function ei_validate_config
     if test "$EI_TYPE" = release
         switch $EI_PROXY
             case jsdelivr statically
-                ei_die "the $EI_PROXY proxy cannot serve release assets; use --proxy github or --type file"
+                # Only worth complaining about when something will actually be
+                # downloaded: an offline install never builds a URL.
+                if test -z "$EI_FILE"
+                    ei_die "the $EI_PROXY proxy cannot serve release assets; use --proxy github or --type file"
+                end
         end
+    end
+
+    if test -n "$EI_FILE"; and not test -f "$EI_FILE"
+        ei_die "no such file: $EI_FILE"
     end
 end
 
 function ei_main
-    argparse -n install.fish 'p/proxy=' 't/tag=' 'd/dir=' 'T/target=' 'type=' 'ref=' 'list' 'h/help' -- $argv
+    argparse -n install.fish 'p/proxy=' 't/tag=' 'd/dir=' 'T/target=' 'type=' 'ref=' 'file=' 'list' 'h/help' -- $argv
     or return 1
 
     if set -q _flag_help
@@ -484,6 +552,9 @@ function ei_main
     if set -q _flag_ref
         set -g EI_REF $_flag_ref
     end
+    if set -q _flag_file
+        set -g EI_FILE $_flag_file
+    end
 
     if set -q _flag_list
         for target in $EI_SUPPORTED_TARGETS
@@ -504,17 +575,27 @@ function ei_main
     end
 
     set -l filename (ei_platform_filename $target)
-    ei_log "installing $EI_BINARY_NAME ($target) into $EI_DIR"
+    if test -n "$EI_FILE"
+        ei_log "installing $EI_BINARY_NAME ($target) from $EI_FILE"
+    else
+        ei_log "installing $EI_BINARY_NAME ($target) into $EI_DIR"
+    end
 
     ei_check_disk_space $EI_DIR
 
     set -g EI_TMP (mktemp -d 2>/dev/null; or echo "$TMPDIR/eish-$fish_pid")
     mkdir -p $EI_TMP
 
-    ei_download (ei_download_url $filename) "$EI_TMP/$filename"
-    or ei_die "download failed"
+    # A local file is used where it lies, so it is never copied or deleted.
+    set -l archive "$EI_TMP/$filename"
+    if test -n "$EI_FILE"
+        set archive $EI_FILE
+    else
+        ei_download (ei_download_url $filename) $archive
+        or ei_die "download failed"
+    end
 
-    ei_extract "$EI_TMP/$filename" "$EI_TMP" "$filename"
+    ei_extract $archive "$EI_TMP" "$filename"
     or ei_die "could not extract $filename"
 
     set -l binary (ei_find_binary $EI_TMP)
