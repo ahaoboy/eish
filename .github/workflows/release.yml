@@ -60,6 +60,10 @@ jobs:
   # `qjs-linux-x86` — so a regression in platform detection or asset selection
   # fails the release instead of a user's install.
   #
+  # A release that ships more than one program has to be named as `repo:program`,
+  # because eish refuses to guess which one an installer is for. `quickjs-ng`
+  # publishes both `qjs` and `qjsc`, so it carries its name.
+  #
   # One runner per OS: the interesting part is running the same installer on
   # each platform, which the build matrix cannot do (those runners are all
   # x86_64 Linux, so every entry would exercise the same detection path).
@@ -118,7 +122,7 @@ jobs:
             boa-dev/boa
             theMackabu/ant
             ahaoboy/es5
-            quickjs-ng/quickjs
+            quickjs-ng/quickjs:qjs
           )
 
           # PowerShell is only exercised on Windows, where both interpreters
@@ -180,11 +184,17 @@ jobs:
             echo "::endgroup::"
           }
 
-          for repo in "${repos[@]}"; do
+          for entry in "${repos[@]}"; do
+            # `owner/repo` or `owner/repo:program`; the suffix names the program
+            # to install when the release publishes more than one.
+            repo="${entry%%:*}"
+            program="${entry#"$repo"}"
+            program="${program#:}"
+
             name="${repo##*/}"
             base="target/verify/$name"
 
-            echo "##### $repo on $(uname -s)/$(uname -m), shells: $SHELLS"
+            echo "##### $entry on $(uname -s)/$(uname -m), shells: $SHELLS"
 
             for shell in $SHELLS; do
               # PowerShell refuses to run a script that does not end in `.ps1`,
@@ -196,8 +206,19 @@ jobs:
               esac
               script="$base.$ext"
 
-              if ! eish "$repo" --shell "$shell" -o "$script"; then
-                echo "::error::$repo: could not generate the $shell installer"
+              # `--name` is only passed when the entry actually names a program.
+              # eish normalises an empty name away, so passing it always would
+              # work, but it would then show up verbatim in the generated
+              # header as `--name ''`.
+              if [ -n "$program" ]; then
+                ok=0
+                eish "$repo" --name "$program" --shell "$shell" -o "$script" || ok=1
+              else
+                ok=0
+                eish "$repo" --shell "$shell" -o "$script" || ok=1
+              fi
+              if [ "$ok" -ne 0 ]; then
+                echo "::error::$entry: could not generate the $shell installer"
                 failed=1
                 continue
               fi
