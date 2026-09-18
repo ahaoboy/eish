@@ -13,8 +13,8 @@ repository = "https://github.com/easy-install/eish"
 default = ["cli"]
 
 # The `eish` binary. Disable it (with --no-default-features) to build only the
-# library, which drops the `clap` dependency entirely.
-cli = ["dep:clap"]
+# library, which drops `clap` and the logger entirely.
+cli = ["dep:clap", "dep:log", "dep:env_logger"]
 
 [[bin]]
 name = "eish"
@@ -23,7 +23,14 @@ required-features = ["cli"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"], optional = true }
+const-str = "1"
+env_logger = { version = "0.11", optional = true, default-features = false, features = [
+    "auto-color",
+    "humantime",
+] }
+git-version = "0.3"
 guess-target = { git = "https://github.com/ahaoboy/guess-target.git", version = "0.1", features = ["serde"] }
+log = { version = "0.4", optional = true }
 minijinja = { version = "2", features = ["custom_syntax"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

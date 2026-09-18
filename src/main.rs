@@ -8,5 +8,9 @@ mod cli;
 use clap::Parser;
 
 fn main() -> std::process::ExitCode {
-    cli::Cli::parse().run()
+    let cli = cli::Cli::parse();
+    // Logging is installed after parsing because `--verbose` and `--quiet`
+    // decide its level.
+    cli.init_logging();
+    cli.run()
 }

@@ -364,6 +364,127 @@ pub fn guess_binary_name(file_name: &str) -> Option<String> {
         .filter(|name| !name.is_empty())
 }
 
+/// Whether an asset belongs to the program called `name`.
+///
+/// This reports the program `guess_target` thinks the file is for, which is not
+/// the same as a prefix match: `crash` and `crash-full` are separate programs,
+/// and `crash-full-x86_64-unknown-linux-gnu.tar.xz` belongs only to the second
+/// even though it starts with the first.
+///
+/// The comparison is case-sensitive, because it is a GitHub asset name being
+/// matched rather than something a user typed freehand.
+///
+/// ```
+/// use eish::target::belongs_to;
+///
+/// assert!(belongs_to("crash-x86_64-unknown-linux-gnu.tar.gz", "crash"));
+/// assert!(!belongs_to("crash-full-x86_64-unknown-linux-gnu.tar.xz", "crash"));
+/// assert!(belongs_to("crash-full-x86_64-unknown-linux-gnu.tar.xz", "crash-full"));
+/// ```
+pub fn belongs_to(file_name: &str, name: &str) -> bool {
+    candidates(file_name).iter().any(|guess| guess.name == name)
+}
+
+/// Every program name mentioned by `files`, sorted and deduplicated.
+///
+/// Used to tell the user what `--name` would accept when their value matched
+/// nothing.
+///
+/// ```
+/// use eish::target::program_names;
+///
+/// let files = [
+///     "crash-x86_64-unknown-linux-gnu.tar.gz",
+///     "crash-full-x86_64-unknown-linux-gnu.tar.xz",
+///     "clash-linux-amd64.tar.gz",
+/// ];
+/// assert_eq!(program_names(files), vec!["clash", "crash", "crash-full"]);
+/// ```
+pub fn program_names<'a, I>(files: I) -> Vec<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut names: Vec<String> = files
+        .into_iter()
+        .flat_map(candidates)
+        .map(|guess| guess.name)
+        .filter(|name| !name.is_empty())
+        .collect();
+
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+/// One program a release publishes, and how much of it is there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgramCoverage {
+    /// The program name, as [`program_names`] reports it.
+    pub name: String,
+    /// How many of [`KNOWN_TARGETS`] this program has an asset for.
+    ///
+    /// Counting platforms rather than files matters: a program that ships one
+    /// archive per platform plus three checksums each should not outrank one
+    /// that simply covers more platforms.
+    pub targets: usize,
+}
+
+/// How much of each program a release covers, best-covered first.
+///
+/// A release that publishes several programs — `crash`, `crash-full` and
+/// `clash` all live in one — needs one of them picked before an installer can be
+/// built, and this says which are available and how complete each one is.
+///
+/// Ties are broken alphabetically so the order does not depend on the order of
+/// the release's assets.
+///
+/// ```
+/// use eish::target::program_coverage;
+///
+/// let files = [
+///     "crash-x86_64-unknown-linux-gnu.tar.gz",
+///     "crash-x86_64-pc-windows-msvc.tar.gz",
+///     "crash-aarch64-apple-darwin.tar.gz",
+///     "crash-full-x86_64-unknown-linux-gnu.tar.xz",
+/// ];
+/// let coverage = program_coverage(files);
+/// assert_eq!(coverage[0].name, "crash");
+/// assert_eq!(coverage[0].targets, 3);
+/// assert_eq!(coverage[1].name, "crash-full");
+/// assert_eq!(coverage[1].targets, 1);
+/// ```
+pub fn program_coverage<'a>(files: impl IntoIterator<Item = &'a str>) -> Vec<ProgramCoverage> {
+    let files: Vec<&str> = files.into_iter().collect();
+
+    let mut coverage: Vec<ProgramCoverage> = program_names(files.iter().copied())
+        .into_iter()
+        .map(|name| {
+            // Score each program against *its own* assets. Asking `best_asset`
+            // once across the whole release would credit only whichever program
+            // happened to win each target, so a release with two programs built
+            // for the same platform would report one of them as absent.
+            let owned: Vec<&str> = files
+                .iter()
+                .copied()
+                .filter(|file| belongs_to(file, &name))
+                .collect();
+
+            let targets = KNOWN_TARGETS
+                .iter()
+                .filter(|target| best_asset(owned.iter().copied(), target, MIN_RANK).is_some())
+                .count();
+
+            ProgramCoverage { name, targets }
+        })
+        .collect();
+
+    coverage.sort_by(|a, b| b.targets.cmp(&a.targets).then_with(|| a.name.cmp(&b.name)));
+    // A program named in a file that matches no platform is not installable
+    // anywhere, so it should not be offered as a choice.
+    coverage.retain(|entry| entry.targets > 0);
+    coverage
+}
+
 /// Triples that can run a binary built for `target`.
 ///
 /// Mirrors `guess_target`'s own ABI compatibility rules (private upstream) and
@@ -774,6 +895,70 @@ mod tests {
             Some("starship")
         );
         assert_eq!(guess_binary_name("checksums.txt"), None);
+    }
+
+    #[test]
+    fn a_program_name_is_not_a_prefix() {
+        // The whole point: `crash-full` is a different program from `crash`,
+        // even though every one of its assets starts with `crash`.
+        assert!(belongs_to("crash-x86_64-unknown-linux-gnu.tar.gz", "crash"));
+        assert!(!belongs_to(
+            "crash-full-x86_64-unknown-linux-gnu.tar.xz",
+            "crash"
+        ));
+        assert!(belongs_to(
+            "crash-full-x86_64-unknown-linux-gnu.tar.xz",
+            "crash-full"
+        ));
+        assert!(!belongs_to(
+            "crash-x86_64-unknown-linux-gnu.tar.gz",
+            "crash-full"
+        ));
+    }
+
+    #[test]
+    fn a_program_name_must_match_exactly() {
+        // Asset names come from the release, so the comparison is not
+        // case-insensitive the way a user-typed value would be.
+        assert!(!belongs_to(
+            "Crash-x86_64-unknown-linux-gnu.tar.gz",
+            "crash"
+        ));
+        assert!(!belongs_to("crash-x86_64-unknown-linux-gnu.tar.gz", "cr"));
+        assert!(!belongs_to(
+            "crash-x86_64-unknown-linux-gnu.tar.gz",
+            "crashfull"
+        ));
+    }
+
+    #[test]
+    fn assets_without_a_platform_belong_to_nothing() {
+        // These are the shared data files in the same release; they name no
+        // program, so no `--name` should claim them.
+        for file in ["country.mmdb.tar.gz", "yacd.tar.gz", "geoip.dat.tar.gz"] {
+            assert!(!belongs_to(file, "crash"), "for {file}");
+            assert!(!belongs_to(file, "country"), "for {file}");
+        }
+    }
+
+    #[test]
+    fn lists_the_programs_a_release_mentions() {
+        let files = [
+            "crash-x86_64-unknown-linux-gnu.tar.gz",
+            "crash-full-x86_64-unknown-linux-gnu.tar.xz",
+            "clash-linux-amd64.tar.gz",
+            "mihomo-linux-amd64.tar.gz",
+            "country.mmdb.tar.gz",
+        ];
+        assert_eq!(
+            program_names(files),
+            vec!["clash", "crash", "crash-full", "mihomo"]
+        );
+    }
+
+    #[test]
+    fn a_release_with_no_recognisable_assets_lists_no_programs() {
+        assert!(program_names(["checksums.txt", "yacd.tar.gz"]).is_empty());
     }
 
     #[test]

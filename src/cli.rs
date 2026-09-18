@@ -9,6 +9,7 @@ use std::process::ExitCode;
 
 use clap::builder::PossibleValue;
 use clap::{Parser, ValueEnum};
+use log::{Level, LevelFilter, info};
 
 use eish::github::{Client, release_from_json_file};
 use eish::spec::RepoSpec;
@@ -21,7 +22,7 @@ use eish::{InstallSpec, Proxy, Resource, Shell};
 #[derive(Debug, Parser)]
 #[command(
     name = "eish",
-    version,
+    version = eish::VERSION,
     about = "Generate installation scripts for GitHub release binaries",
     long_about = None,
     after_help = "Examples:\n  \
@@ -54,6 +55,14 @@ pub struct Cli {
     #[arg(short, long)]
     binary: Option<String>,
 
+    /// Install this program, when the release publishes several.
+    ///
+    /// Matches the name `eish` reports for the asset (`crash` and `crash-full`
+    /// are different programs). Use `--list` on the repository to see the
+    /// available names.
+    #[arg(long, value_name = "NAME")]
+    name: Option<String>,
+
     /// Target triple the generated installer defaults to, skipping detection.
     #[arg(long)]
     target: Option<String>,
@@ -82,13 +91,6 @@ pub struct Cli {
     #[arg(long, default_value = eish::github::DEFAULT_API_BASE)]
     api_base: String,
 
-    /// GitHub token used for the API request.
-    ///
-    /// When omitted, `GITHUB_TOKEN`, `GH_TOKEN`, `gh auth token` and
-    /// `git credential fill` are tried in turn.
-    #[arg(long)]
-    token: Option<String>,
-
     /// Read the release from a JSON file instead of calling the API.
     #[arg(long, value_name = "PATH")]
     release_json: Option<PathBuf>,
@@ -105,7 +107,14 @@ pub struct Cli {
     #[arg(long)]
     list: bool,
 
-    /// Suppress progress messages.
+    /// Print progress messages.
+    ///
+    /// Repeat for more detail. Progress goes to stderr, so it never mixes with
+    /// the script or the `--list` table on stdout.
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8,
+
+    /// Suppress everything but errors.
     #[arg(short, long)]
     quiet: bool,
 }
@@ -136,6 +145,47 @@ impl ValueEnum for ResourceType {
 }
 
 impl Cli {
+    /// Install the process-wide logger.
+    ///
+    /// Progress and warnings go to stderr through [`log`], which keeps stdout
+    /// reserved for the generated script and the `--list` table — both are
+    /// meant to be piped into something else, and a stray "querying GitHub"
+    /// line in the middle of them is at best noise and at worst a parse error.
+    ///
+    /// The default level is `warn`, so a plain run is silent unless something
+    /// needs attention. `-v` raises it to `info` and `-vv` to `debug`; `-q`
+    /// drops it to errors only and wins if both are given, since it is the
+    /// stricter request. `EISH_LOG` (or `RUST_LOG`) overrides all of this.
+    pub fn init_logging(&self) {
+        let default = if self.quiet {
+            LevelFilter::Error
+        } else {
+            match self.verbose {
+                0 => LevelFilter::Warn,
+                1 => LevelFilter::Info,
+                _ => LevelFilter::Debug,
+            }
+        };
+
+        let mut builder = env_logger::Builder::new();
+        builder.filter_level(default);
+        // Parsed last, so an explicit setting beats the flags above.
+        builder.parse_env("EISH_LOG");
+        builder.parse_default_env();
+        builder.format(|buffer, record| {
+            use std::io::Write as _;
+            let message = record.args();
+            match record.level() {
+                Level::Error => writeln!(buffer, "error: {message}"),
+                // The message already reads as a sentence, so the level word is
+                // only worth printing when it is not the ordinary case.
+                Level::Warn => writeln!(buffer, "warning: {message}"),
+                _ => writeln!(buffer, "eish: {message}"),
+            }
+        });
+        let _ = builder.try_init();
+    }
+
     /// Run the command, returning the process exit code.
     pub fn run(self) -> ExitCode {
         match self.execute() {
@@ -161,6 +211,7 @@ impl Cli {
             .with_install_dir(self.dir.clone())
             .with_min_disk_space_mb(self.min_disk_space)
             .with_default_target(self.target.clone())
+            .with_name(self.name.clone())
             .with_invocation(invocation())
             .with_resource(match self.resource_type {
                 ResourceType::Release => Resource::Release,
@@ -183,17 +234,15 @@ impl Cli {
             (_, false) => None,
             (Some(path), _) => Some(release_from_json_file(path)?),
             (None, _) => {
-                let client = Client::new()
-                    .with_api_base(self.api_base.clone())
-                    .with_token(self.token.clone());
+                let client = Client::new().with_api_base(self.api_base.clone());
 
                 // Say which credential is in play, so a later 403 is easy to
                 // attribute to the wrong token rather than to rate limiting.
                 if let Some(source) = client.credential_source() {
-                    self.progress(&format!("using credentials from {source}"))?;
+                    info!("using credentials from {source}");
                 }
 
-                self.progress(&format!("querying GitHub for {}", spec.slug()))?;
+                info!("querying GitHub for {}", spec.slug());
                 Some(client.release(&spec.owner, &spec.repo, Some(&spec.tag))?)
             }
         };
@@ -202,10 +251,7 @@ impl Cli {
             Some(release) => spec.apply_release_checked(release)?,
             None => {
                 if spec.apply_assets(self.assets.iter().map(String::as_str)) == 0 {
-                    return Err(eish::Error::NoAssets {
-                        repo: spec.slug(),
-                        tag: spec.tag.clone(),
-                    });
+                    return Err(spec.no_assets_error());
                 }
             }
         }
@@ -214,17 +260,17 @@ impl Cli {
 
         if self.list {
             for asset in &spec.assets {
-                println!("{}\t{}", asset.target, asset.filename);
+                println!("{}\t{}\t{}", asset.program, asset.target, asset.filename);
             }
             return Ok(());
         }
 
-        self.progress(&format!(
+        info!(
             "found {} target(s) for {} ({})",
             spec.assets.len(),
             spec.slug(),
             spec.resolved_tag.as_deref().unwrap_or(&spec.tag)
-        ))?;
+        );
         let script = spec.render()?;
         self.write(&script)
     }
@@ -236,7 +282,7 @@ impl Cli {
                     path: path.clone(),
                     source,
                 })?;
-                self.progress(&format!("wrote {}", path.display()))?;
+                info!("wrote {}", path.display());
                 Ok(())
             }
             None => {
@@ -253,18 +299,6 @@ impl Cli {
             }
         }
     }
-
-    /// Print a progress line on stderr, unless `--quiet` was given.
-    fn progress(&self, message: &str) -> eish::Result<()> {
-        if self.quiet {
-            return Ok(());
-        }
-        let mut err = std::io::stderr().lock();
-        writeln!(err, "eish: {message}").map_err(|source| eish::Error::WriteFile {
-            path: PathBuf::from("<stderr>"),
-            source,
-        })
-    }
 }
 
 /// The command line that produced this process, for the generated header.
@@ -274,9 +308,8 @@ impl Cli {
 /// such as `--release-json <path>`. The program name is normalised to `eish` so
 /// the printed command does not depend on where the binary happens to live.
 ///
-/// Values of secret-bearing options are replaced with a placeholder: the
-/// generated script is meant to be committed and shared, so a token that was
-/// only ever passed on the command line must not end up inside it.
+/// Nothing here needs hiding: credentials come from the environment or a helper
+/// rather than the command line, so a generated script can be committed as-is.
 fn invocation() -> String {
     let mut args = std::env::args();
     let _program = args.next();
@@ -285,46 +318,13 @@ fn invocation() -> String {
 
 /// Build the header command from the arguments after the program name.
 ///
-/// Split out from [`invocation`] so the redaction can be tested without
-/// spawning a process.
+/// Split out from [`invocation`] so the quoting can be tested without spawning
+/// a process.
 fn build_invocation(args: impl IntoIterator<Item = String>) -> String {
-    let mut parts = vec!["eish".to_string()];
-    let mut args = args.into_iter().peekable();
-
-    while let Some(arg) = args.next() {
-        // `--token=value`
-        if let Some((name, _)) = arg.split_once('=') {
-            if is_secret_option(name) {
-                parts.push(format!("{name}=<redacted>"));
-            } else {
-                parts.push(quote_arg(&arg));
-            }
-            continue;
-        }
-
-        // `--token value`
-        if is_secret_option(&arg) {
-            // Consume the next argument unconditionally. Skipping a value that
-            // starts with `-` would risk printing it, and clap rejects such a
-            // value anyway, so there is nothing to preserve by being clever.
-            args.next();
-            parts.push(format!("{arg} <redacted>"));
-            continue;
-        }
-
-        parts.push(quote_arg(&arg));
-    }
-
-    parts.join(" ")
-}
-
-/// Options whose value must never be written into a generated script.
-///
-/// Today `--token` is the only one, and it has no short alias. Anything added
-/// here must stay in step with the `Cli` struct: a new secret-bearing option
-/// that is not listed would be printed in full.
-fn is_secret_option(arg: &str) -> bool {
-    matches!(arg, "--token")
+    std::iter::once("eish".to_string())
+        .chain(args.into_iter().map(|arg| quote_arg(&arg)))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Quote a single argument for a POSIX shell if it needs it.
@@ -358,39 +358,6 @@ mod tests {
     }
 
     #[test]
-    fn redacts_a_token_passed_as_a_separate_argument() {
-        let command = invocation(&["acme/tool", "--token", "ghp_secret", "--list"]);
-        assert!(!command.contains("ghp_secret"), "{command}");
-        assert_eq!(command, "eish acme/tool --token <redacted> --list");
-    }
-
-    #[test]
-    fn redacts_a_token_passed_with_equals() {
-        let command = invocation(&["acme/tool", "--token=ghp_secret"]);
-        assert!(!command.contains("ghp_secret"), "{command}");
-        assert_eq!(command, "eish acme/tool --token=<redacted>");
-    }
-
-    #[test]
-    fn redacts_a_token_that_starts_with_a_dash() {
-        // The value is consumed regardless of its shape, so a secret cannot
-        // survive by looking like the next option.
-        let command = invocation(&["acme/tool", "--token", "-dashed", "--list"]);
-        assert!(!command.contains("dashed"), "{command}");
-        assert_eq!(command, "eish acme/tool --token <redacted> --list");
-    }
-
-    #[test]
-    fn a_dangling_token_still_reports_the_option() {
-        // clap complains about the missing value; the header should not invent
-        // one.
-        assert_eq!(
-            invocation(&["acme/tool", "--token"]),
-            "eish acme/tool --token <redacted>"
-        );
-    }
-
-    #[test]
     fn quotes_arguments_that_need_it() {
         assert_eq!(
             invocation(&["acme/tool", "--dir", "/opt/my tools"]),
@@ -413,11 +380,26 @@ mod tests {
         );
     }
 
+    /// Credentials never reach the command line, so the header is safe to share
+    /// as-is. This guards against someone adding a secret-bearing flag later
+    /// without thinking about the generated header.
     #[test]
-    fn only_the_token_option_is_secret() {
-        assert!(is_secret_option("--token"));
-        // A lookalike must not be redacted, or the header would lose detail.
-        assert!(!is_secret_option("--token-file"));
-        assert!(!is_secret_option("--tag"));
+    fn no_cli_option_is_secret() {
+        use clap::CommandFactory as _;
+
+        let command = Cli::command();
+        let suspicious: Vec<&str> = command
+            .get_arguments()
+            .filter_map(|arg| arg.get_long())
+            .filter(|long| {
+                let long = long.to_ascii_lowercase();
+                long.contains("token") || long.contains("password") || long.contains("secret")
+            })
+            .collect();
+
+        assert!(
+            suspicious.is_empty(),
+            "these options look secret and would be written into generated scripts: {suspicious:?}"
+        );
     }
 }

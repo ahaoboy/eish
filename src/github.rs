@@ -98,7 +98,7 @@ impl Client {
     /// An empty or blank value is ignored, leaving discovery enabled.
     #[must_use]
     pub fn with_token(mut self, token: Option<String>) -> Self {
-        self.token = token.and_then(Token::from_flag);
+        self.token = token.and_then(Token::explicit);
         self
     }
 
@@ -198,7 +198,7 @@ fn map_request_error(
             status,
             url: url.to_string(),
             hint: "not found; if the repository is private, \
-                   pass --token, set GITHUB_TOKEN, or run `gh auth login`",
+                   set GITHUB_TOKEN or run `gh auth login`",
         };
     }
 
@@ -218,22 +218,22 @@ fn map_request_error(
     let hint = match (status, token.map(Token::source)) {
         (401, _) => "the credentials were rejected; refresh the token or run `gh auth login`",
         (_, Some(source)) => match source {
-            Source::Flag => "--token was rejected or has no access to this repository",
+            Source::Explicit => "the token was rejected or has no access to this repository",
             Source::Environment => "$GITHUB_TOKEN was rejected or has no access to this repository",
             Source::GhCli => {
                 "the token from `gh auth token` has no access to this repository; \
-                 run `gh auth refresh` or pass --token"
+                 run `gh auth refresh`"
             }
             Source::GitCredential => {
                 "the token from git credentials has no access to this repository; \
-                 run `gh auth login` or pass --token"
+                 run `gh auth login`"
             }
         },
         (403 | 429, None) => {
             "the anonymous rate limit (60 requests/hour) is exhausted and no credentials \
-             were found; pass --token, set GITHUB_TOKEN, or run `gh auth login`"
+             were found; set GITHUB_TOKEN or run `gh auth login`"
         }
-        (_, None) => "the request was refused; pass --token or set GITHUB_TOKEN",
+        (_, None) => "the request was refused; set GITHUB_TOKEN or run `gh auth login`",
     };
 
     Error::ApiStatus {
@@ -279,7 +279,7 @@ mod tests {
         let error = map_request_error(
             "https://api.github.com/repos/foo/bar/releases/tags/v1",
             Some("v1"),
-            Some(&Token::new("t", Source::Flag)),
+            Some(&Token::new("t", Source::Explicit)),
             ureq::Error::StatusCode(404),
         );
         assert!(matches!(error, Error::ReleaseNotFound { .. }));
@@ -312,17 +312,19 @@ mod tests {
         let authenticated = map_request_error(
             "https://api.github.com/repos/foo/bar/releases/latest",
             None,
-            Some(&Token::new("t", Source::Flag)),
+            Some(&Token::new("t", Source::Explicit)),
             ureq::Error::StatusCode(403),
         );
         assert!(
             !authenticated.to_string().contains("rate limit"),
             "{authenticated}"
         );
+        // The advice must not name a flag that no longer exists.
         assert!(
-            authenticated.to_string().contains("--token"),
+            authenticated.to_string().contains("rejected"),
             "{authenticated}"
         );
+        assert!(!authenticated.to_string().contains("--token"));
 
         // The hint names the helper that supplied the token.
         let from_gh = map_request_error(

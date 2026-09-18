@@ -9,6 +9,11 @@
 //! 2. `gh auth token` (GitHub CLI)
 //! 3. `git credential fill` (Git Credential Manager, `credential.helper`)
 //!
+//! There is deliberately no `--token` flag. A secret on the command line lands in
+//! shell history, in `ps` output, and in anything that records the command —
+//! including the header of the very script this tool writes. Both supported
+//! paths keep it somewhere the shell never sees.
+//!
 //! Discovery is best effort by design: a missing command, a timeout or empty
 //! output all mean "no token", and the request simply stays anonymous.
 
@@ -28,8 +33,8 @@ const HELPER_TIMEOUT: Duration = Duration::from_secs(3);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Source {
-    /// Passed explicitly via `--token`.
-    Flag,
+    /// Handed to [`crate::Client::with_token`] by the caller.
+    Explicit,
     /// Read from `GITHUB_TOKEN` or `GH_TOKEN`.
     Environment,
     /// Obtained by running `gh auth token`.
@@ -42,14 +47,14 @@ impl Source {
     /// Short identifier used in messages.
     pub const fn as_str(self) -> &'static str {
         match self {
-            Source::Flag => "--token",
+            Source::Explicit => "an explicitly supplied token",
             Source::Environment => "$GITHUB_TOKEN",
             Source::GhCli => "gh auth token",
             Source::GitCredential => "git credential fill",
         }
     }
 
-    /// Whether the token was *found* rather than supplied by the user.
+    /// Whether the token was *found* rather than supplied by the caller.
     pub const fn is_discovered(self) -> bool {
         matches!(self, Source::GhCli | Source::GitCredential)
     }
@@ -81,12 +86,12 @@ impl Token {
         }
     }
 
-    /// A token supplied on the command line.
+    /// A token supplied by the caller through [`crate::Client::with_token`].
     ///
     /// Returns `None` for an empty or whitespace-only value, so callers can
     /// treat "provided but useless" the same as "not provided".
-    pub fn from_flag(value: impl Into<String>) -> Option<Self> {
-        Self::clean(value.into(), Source::Flag)
+    pub fn explicit(value: impl Into<String>) -> Option<Self> {
+        Self::clean(value.into(), Source::Explicit)
     }
 
     /// The token in `GITHUB_TOKEN` or `GH_TOKEN`, if either is set.
@@ -160,12 +165,12 @@ impl Token {
 
     /// Whether this token may be sent to `api_base`.
     ///
-    /// Tokens the user supplied — via `--token` or the environment — go
-    /// wherever `--api-base` points, because the user asked for exactly that.
-    /// Credentials *discovered* from `gh` or `git` belong to github.com, so they
-    /// are only attached when the API root really is github.com; sending them to
-    /// an arbitrary `--api-base` host would hand a github.com token to a third
-    /// party.
+    /// Tokens the caller supplied — through [`crate::Client::with_token`] or the
+    /// environment — go wherever `--api-base` points, because the caller asked
+    /// for exactly that. Credentials *discovered* from `gh` or `git` belong to
+    /// github.com, so they are only attached when the API root really is
+    /// github.com; sending them to an arbitrary `--api-base` host would hand a
+    /// github.com token to a third party.
     pub fn may_send_to(&self, api_base: &str) -> bool {
         !self.source.is_discovered()
             || host_of(api_base)
@@ -291,10 +296,10 @@ mod tests {
 
     #[test]
     fn rejects_blank_values() {
-        assert!(Token::from_flag("").is_none());
-        assert!(Token::from_flag("   ").is_none());
-        assert!(Token::from_flag(" token ").is_some());
-        assert_eq!(Token::from_flag(" token ").unwrap().value(), "token");
+        assert!(Token::explicit("").is_none());
+        assert!(Token::explicit("   ").is_none());
+        assert!(Token::explicit(" token ").is_some());
+        assert_eq!(Token::explicit(" token ").unwrap().value(), "token");
     }
 
     #[test]
@@ -327,8 +332,8 @@ mod tests {
     }
 
     #[test]
-    fn supplied_tokens_go_wherever_the_user_points() {
-        for source in [Source::Flag, Source::Environment] {
+    fn supplied_tokens_go_wherever_the_caller_points() {
+        for source in [Source::Explicit, Source::Environment] {
             let token = Token::new("t", source);
             assert!(token.may_send_to("https://ghe.corp.example/api/v3"));
             assert!(token.may_send_to("https://api.github.com"));
@@ -337,10 +342,10 @@ mod tests {
 
     #[test]
     fn debug_redacts_the_value() {
-        let token = Token::new("gho_supersecret", Source::Flag);
+        let token = Token::new("gho_supersecret", Source::Explicit);
         let rendered = format!("{token:?}");
         assert!(!rendered.contains("gho_supersecret"), "{rendered}");
         assert!(rendered.contains("<redacted>"), "{rendered}");
-        assert!(rendered.contains("Flag"), "{rendered}");
+        assert!(rendered.contains("Explicit"), "{rendered}");
     }
 }

@@ -80,6 +80,29 @@ pub enum Error {
         available: String,
     },
 
+    /// A program name was requested that the release does not publish.
+    #[error("no assets for `{name}` in this release; available programs: {available}")]
+    UnknownProgram {
+        /// The name that was requested.
+        name: String,
+        /// Space separated list of program names that *are* available.
+        available: String,
+    },
+
+    /// The release publishes several programs and none was chosen.
+    #[error(
+        "{repo} publishes {} programs and an installer installs only one\n  \
+         choose one with --name: {}",
+        programs.len(),
+        programs.join(", ")
+    )]
+    AmbiguousProgram {
+        /// `owner/repo`.
+        repo: String,
+        /// The programs on offer, best-covered first.
+        programs: Vec<String>,
+    },
+
     /// The GitHub API answered, but with an error status we can explain.
     #[error("GitHub API request to {url} failed with HTTP {status}: {hint}")]
     ApiStatus {

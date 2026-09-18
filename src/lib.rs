@@ -70,3 +70,30 @@ pub use shell::Shell;
 pub use spec::{AssetEntry, InstallSpec, RepoSpec, Resource};
 pub use target::{KNOWN_TARGETS, guess_target, guess_targets};
 pub use token::Token;
+
+/// The released version, from `Cargo.toml`.
+pub const CARGO_PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The commit the binary was built from.
+///
+/// `git describe` falls back to the abbreviated SHA, and appends `-modified`
+/// when the worktree had uncommitted or untracked files, so a local build is
+/// distinguishable from a released one.
+///
+/// One caveat: `git_version!` reads the repository at compile time but does not
+/// register a rebuild trigger, so a binary built right after a commit can carry
+/// the previous hash until something else forces a recompile. `cargo clean -p
+/// eish` when it matters.
+pub const GIT_HASH: &str = git_version::git_version!();
+
+/// Version and commit in one string, joined at compile time.
+///
+/// Stamped into every generated script, so a file found in the wild can be
+/// traced to the exact build that wrote it — two runs of the same version can
+/// otherwise differ, and this is what tells them apart.
+///
+/// ```
+/// let identity = eish::VERSION;
+/// assert!(identity.starts_with(eish::CARGO_PKG_VERSION), "{identity}");
+/// ```
+pub const VERSION: &str = const_str::concat!(CARGO_PKG_VERSION, " ", GIT_HASH);

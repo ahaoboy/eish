@@ -68,7 +68,7 @@ struct Context<'a> {
     filenames: Vec<&'a str>,
     /// The command that reproduces this installer, for the header comment.
     command: String,
-    /// Version of `eish` that produced the script.
+    /// `eish` version and commit that produced the script.
     eish_version: &'static str,
 }
 
@@ -118,7 +118,7 @@ impl<'a> Context<'a> {
             command: spec.regenerate_command(),
             targets,
             assets,
-            eish_version: env!("CARGO_PKG_VERSION"),
+            eish_version: crate::VERSION,
         }
     }
 }
