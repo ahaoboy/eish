@@ -66,6 +66,8 @@ struct Context<'a> {
     asset_groups: Vec<AssetGroup<'a>>,
     /// Every distinct asset file name, sorted; for error messages.
     filenames: Vec<&'a str>,
+    /// The command that reproduces this installer, for the header comment.
+    command: String,
     /// Version of `eish` that produced the script.
     eish_version: &'static str,
 }
@@ -113,6 +115,7 @@ impl<'a> Context<'a> {
             fallbacks: build_fallbacks(spec),
             asset_groups,
             filenames,
+            command: spec.regenerate_command(),
             targets,
             assets,
             eish_version: env!("CARGO_PKG_VERSION"),

@@ -97,6 +97,13 @@ pub struct InstallSpec {
     pub assets: Vec<AssetEntry>,
     /// Target triple the installer uses when detection has to be bypassed.
     pub default_target: Option<String>,
+    /// The exact command line that produced this spec, when it is known.
+    ///
+    /// Set by the CLI from its own arguments, which is the only way to record
+    /// things the spec cannot represent — `--release-json` above all, since the
+    /// file it named is not part of the spec. Library callers leave it `None`
+    /// and get a reconstruction instead.
+    pub invocation: Option<String>,
 }
 
 impl InstallSpec {
@@ -115,7 +122,16 @@ impl InstallSpec {
             min_disk_space_mb: DEFAULT_MIN_DISK_SPACE_MB,
             assets: Vec::new(),
             default_target: None,
+            invocation: None,
         }
+    }
+
+    /// Record the command line that produced this spec.
+    #[must_use]
+    pub fn with_invocation(mut self, invocation: impl Into<String>) -> Self {
+        let invocation = invocation.into();
+        self.invocation = (!invocation.trim().is_empty()).then(|| invocation.trim().to_string());
+        self
     }
 
     /// `owner/repo`, used in messages and comments.
@@ -306,6 +322,88 @@ impl InstallSpec {
     /// Render the installer for [`InstallSpec::shell`].
     pub fn render(&self) -> Result<String> {
         crate::render::render(self)
+    }
+
+    /// The command that reproduces this installer.
+    ///
+    /// Returns the recorded [`InstallSpec::invocation`] when the CLI supplied
+    /// one, and otherwise reconstructs an equivalent command from the fields —
+    /// a library caller has no command line, but the spec still describes one.
+    /// Only values differing from the documented defaults are spelled out, so
+    /// the result stays readable.
+    ///
+    /// ```
+    /// use eish::{InstallSpec, Proxy, Shell};
+    ///
+    /// let spec = InstallSpec::new("acme", "tool")
+    ///     .with_shell(Shell::Fish)
+    ///     .with_proxy(Proxy::Xget);
+    /// assert_eq!(
+    ///     spec.regenerate_command(),
+    ///     "eish acme/tool --shell fish --proxy xget",
+    /// );
+    /// ```
+    pub fn regenerate_command(&self) -> String {
+        if let Some(invocation) = &self.invocation {
+            return invocation.clone();
+        }
+        self.reconstructed_command()
+    }
+
+    /// Build a command from the spec fields, for callers without a command line.
+    fn reconstructed_command(&self) -> String {
+        let mut parts = vec!["eish".to_string()];
+
+        let mut repo = self.slug();
+        if self.tag != "latest" {
+            repo.push('@');
+            repo.push_str(&self.tag);
+        }
+        parts.push(repo);
+
+        // Listed in the same order as `eish --help`, which makes a long command
+        // easier to scan.
+        parts.push(format!("--shell {}", self.shell));
+
+        if self.proxy != Proxy::default() {
+            parts.push(format!("--proxy {}", self.proxy));
+        }
+        if let Some(binary) = &self.binary {
+            parts.push(format!("--binary {}", quote(binary)));
+        }
+        if let Some(target) = &self.default_target {
+            parts.push(format!("--target {}", quote(target)));
+        }
+        if self.install_dir != DEFAULT_INSTALL_DIR {
+            parts.push(format!("--dir {}", quote(&self.install_dir)));
+        }
+        if let Resource::File { reference } = &self.resource {
+            parts.push("--type file".to_string());
+            parts.push(format!("--ref {}", quote(reference)));
+        }
+        if self.min_disk_space_mb != DEFAULT_MIN_DISK_SPACE_MB {
+            parts.push(format!("--min-disk-space {}", self.min_disk_space_mb));
+        }
+
+        parts.join(" ")
+    }
+}
+
+/// Quote a value for a POSIX shell if it contains anything that would otherwise
+/// be split or interpreted.
+///
+/// A leading `~` is deliberately *not* treated as safe: unquoted it would be
+/// expanded by the shell, which changes what is passed to `eish`.
+fn quote(value: &str) -> String {
+    let safe = !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-/:+@=,".contains(c));
+
+    if safe {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', r"'\''"))
     }
 }
 
@@ -646,5 +744,108 @@ mod tests {
     fn falls_back_to_the_repo_name_without_assets() {
         let spec = InstallSpec::new("owner", "some-tool");
         assert_eq!(spec.binary_name(), "some-tool");
+    }
+
+    #[test]
+    fn reconstructs_a_minimal_command() {
+        let spec = InstallSpec::new("acme", "tool");
+        // Defaults are omitted, but the shell is always stated because it
+        // cannot be inferred from the repository.
+        assert_eq!(spec.regenerate_command(), "eish acme/tool --shell bash");
+    }
+
+    #[test]
+    fn reconstructs_the_tag_and_options() {
+        let spec = InstallSpec::new("acme", "tool")
+            .with_tag("v1.2.3")
+            .with_shell(Shell::Fish)
+            .with_proxy(Proxy::Xget)
+            .with_binary("mytool")
+            .with_default_target(Some("x86_64-unknown-linux-gnu".to_string()))
+            .with_install_dir("/opt/tool")
+            .with_min_disk_space_mb(200);
+
+        let command = spec.regenerate_command();
+        for expected in [
+            "eish acme/tool@v1.2.3",
+            "--shell fish",
+            "--proxy xget",
+            "--binary mytool",
+            "--target x86_64-unknown-linux-gnu",
+            "--dir /opt/tool",
+            "--min-disk-space 200",
+        ] {
+            assert!(
+                command.contains(expected),
+                "{expected:?} missing from {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn reconstructs_the_file_resource() {
+        let spec = InstallSpec::new("acme", "tool").with_resource(Resource::File {
+            reference: "dev".to_string(),
+        });
+        let command = spec.regenerate_command();
+        assert!(command.contains("--type file"), "{command}");
+        assert!(command.contains("--ref dev"), "{command}");
+    }
+
+    #[test]
+    fn quotes_values_that_need_it() {
+        // A space would otherwise split the argument in two.
+        let spec = InstallSpec::new("acme", "tool").with_install_dir("/opt/my tools");
+        assert!(
+            spec.regenerate_command().contains("--dir '/opt/my tools'"),
+            "{}",
+            spec.regenerate_command()
+        );
+
+        // A leading `~` is unsafe unquoted: the shell would expand it, which
+        // changes the argument `eish` receives.
+        let spec = InstallSpec::new("acme", "tool").with_install_dir("~/bin");
+        assert!(
+            spec.regenerate_command().contains("--dir '~/bin'"),
+            "{}",
+            spec.regenerate_command()
+        );
+    }
+
+    #[test]
+    fn an_explicit_invocation_wins() {
+        // The CLI records argv verbatim, which is the only way to capture things
+        // the spec does not model — `--release-json` above all.
+        let spec = InstallSpec::new("acme", "tool")
+            .with_invocation("eish acme/tool --release-json release.json --quiet");
+        assert_eq!(
+            spec.regenerate_command(),
+            "eish acme/tool --release-json release.json --quiet"
+        );
+    }
+
+    #[test]
+    fn a_blank_invocation_is_ignored() {
+        let spec = InstallSpec::new("acme", "tool").with_invocation("   ");
+        assert_eq!(spec.regenerate_command(), "eish acme/tool --shell bash");
+    }
+
+    #[test]
+    fn the_command_appears_in_every_rendered_script() {
+        for shell in Shell::ALL {
+            let spec = InstallSpec::new("acme", "tool")
+                .with_shell(shell)
+                .with_invocation("eish acme/tool --shell bash --proxy xget");
+            let script = spec.render().unwrap();
+
+            assert!(
+                script.contains("eish acme/tool --shell bash --proxy xget"),
+                "{shell} header is missing the command"
+            );
+            assert!(
+                script.contains("not meant to be"),
+                "{shell} header is missing the do-not-edit notice"
+            );
+        }
     }
 }

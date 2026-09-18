@@ -161,6 +161,7 @@ impl Cli {
             .with_install_dir(self.dir.clone())
             .with_min_disk_space_mb(self.min_disk_space)
             .with_default_target(self.target.clone())
+            .with_invocation(invocation())
             .with_resource(match self.resource_type {
                 ResourceType::Release => Resource::Release,
                 ResourceType::File => Resource::File {
@@ -263,5 +264,160 @@ impl Cli {
             path: PathBuf::from("<stderr>"),
             source,
         })
+    }
+}
+
+/// The command line that produced this process, for the generated header.
+///
+/// Taken from `argv` rather than rebuilt from the parsed options so that it
+/// stays exactly what the user typed — including things the spec does not model,
+/// such as `--release-json <path>`. The program name is normalised to `eish` so
+/// the printed command does not depend on where the binary happens to live.
+///
+/// Values of secret-bearing options are replaced with a placeholder: the
+/// generated script is meant to be committed and shared, so a token that was
+/// only ever passed on the command line must not end up inside it.
+fn invocation() -> String {
+    let mut args = std::env::args();
+    let _program = args.next();
+    build_invocation(args)
+}
+
+/// Build the header command from the arguments after the program name.
+///
+/// Split out from [`invocation`] so the redaction can be tested without
+/// spawning a process.
+fn build_invocation(args: impl IntoIterator<Item = String>) -> String {
+    let mut parts = vec!["eish".to_string()];
+    let mut args = args.into_iter().peekable();
+
+    while let Some(arg) = args.next() {
+        // `--token=value`
+        if let Some((name, _)) = arg.split_once('=') {
+            if is_secret_option(name) {
+                parts.push(format!("{name}=<redacted>"));
+            } else {
+                parts.push(quote_arg(&arg));
+            }
+            continue;
+        }
+
+        // `--token value`
+        if is_secret_option(&arg) {
+            // Consume the next argument unconditionally. Skipping a value that
+            // starts with `-` would risk printing it, and clap rejects such a
+            // value anyway, so there is nothing to preserve by being clever.
+            args.next();
+            parts.push(format!("{arg} <redacted>"));
+            continue;
+        }
+
+        parts.push(quote_arg(&arg));
+    }
+
+    parts.join(" ")
+}
+
+/// Options whose value must never be written into a generated script.
+///
+/// Today `--token` is the only one, and it has no short alias. Anything added
+/// here must stay in step with the `Cli` struct: a new secret-bearing option
+/// that is not listed would be printed in full.
+fn is_secret_option(arg: &str) -> bool {
+    matches!(arg, "--token")
+}
+
+/// Quote a single argument for a POSIX shell if it needs it.
+fn quote_arg(arg: &str) -> String {
+    let safe = !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-/:+@=,".contains(c));
+
+    if safe {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', r"'\''"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn invocation(args: &[&str]) -> String {
+        build_invocation(args.iter().map(|s| (*s).to_string()))
+    }
+
+    #[test]
+    fn records_the_arguments_as_typed() {
+        assert_eq!(
+            invocation(&["acme/tool@v1", "--shell", "fish", "-o", "install.fish"]),
+            "eish acme/tool@v1 --shell fish -o install.fish"
+        );
+    }
+
+    #[test]
+    fn redacts_a_token_passed_as_a_separate_argument() {
+        let command = invocation(&["acme/tool", "--token", "ghp_secret", "--list"]);
+        assert!(!command.contains("ghp_secret"), "{command}");
+        assert_eq!(command, "eish acme/tool --token <redacted> --list");
+    }
+
+    #[test]
+    fn redacts_a_token_passed_with_equals() {
+        let command = invocation(&["acme/tool", "--token=ghp_secret"]);
+        assert!(!command.contains("ghp_secret"), "{command}");
+        assert_eq!(command, "eish acme/tool --token=<redacted>");
+    }
+
+    #[test]
+    fn redacts_a_token_that_starts_with_a_dash() {
+        // The value is consumed regardless of its shape, so a secret cannot
+        // survive by looking like the next option.
+        let command = invocation(&["acme/tool", "--token", "-dashed", "--list"]);
+        assert!(!command.contains("dashed"), "{command}");
+        assert_eq!(command, "eish acme/tool --token <redacted> --list");
+    }
+
+    #[test]
+    fn a_dangling_token_still_reports_the_option() {
+        // clap complains about the missing value; the header should not invent
+        // one.
+        assert_eq!(
+            invocation(&["acme/tool", "--token"]),
+            "eish acme/tool --token <redacted>"
+        );
+    }
+
+    #[test]
+    fn quotes_arguments_that_need_it() {
+        assert_eq!(
+            invocation(&["acme/tool", "--dir", "/opt/my tools"]),
+            "eish acme/tool --dir '/opt/my tools'"
+        );
+        // A quote inside a value needs the POSIX escape dance.
+        assert_eq!(invocation(&["a b's"]), r"eish 'a b'\''s'");
+        // Unquoted, the shell would expand this before `eish` saw it.
+        assert_eq!(invocation(&["--dir", "~/bin"]), "eish --dir '~/bin'");
+    }
+
+    #[test]
+    fn leaves_ordinary_arguments_unquoted() {
+        assert_eq!(
+            invocation(&[
+                "https://github.com/a/b@v1.2.3",
+                "--target=x86_64-unknown-linux-gnu"
+            ]),
+            "eish https://github.com/a/b@v1.2.3 --target=x86_64-unknown-linux-gnu"
+        );
+    }
+
+    #[test]
+    fn only_the_token_option_is_secret() {
+        assert!(is_secret_option("--token"));
+        // A lookalike must not be redacted, or the header would lose detail.
+        assert!(!is_secret_option("--token-file"));
+        assert!(!is_secret_option("--tag"));
     }
 }
