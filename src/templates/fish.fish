@@ -311,6 +311,97 @@ function ei_is_windows
     string match -qr '^(MINGW|MSYS|CYGWIN|Windows|UWIN)' -- $os
 end
 
+# Name of a PowerShell interpreter, or nothing if there is none.
+#
+# 5.1 (`powershell`) and 7+ (`pwsh`) both do everything this script asks of
+# them, so whichever is present will do.
+function ei_powershell_bin
+    if ei_command_exists powershell
+        echo powershell
+    else if ei_command_exists pwsh
+        echo pwsh
+    end
+end
+
+# The path as a Windows program spells it: backslashes, drive letter.
+#
+# This is for values a Windows program will consume — the registry, GITHUB_PATH
+# — not for anything a person reads; `ei_display_path` covers those. Without
+# `cygpath` the path is passed through rather than guessed: `GetFullPath` would
+# read `/c/Users/x` as a path on the current drive and produce `C:\c\Users\x`.
+function ei_windows_path --argument-names path
+    if ei_command_exists cygpath
+        cygpath -w $path
+        return 0
+    end
+
+    echo $path
+end
+
+# Expand `~` and make the path absolute.
+#
+# An absolute path matters because the directory ends up in a shell profile as
+# `export PATH="..."`; a relative one would break the next time the shell
+# started somewhere else.
+#
+# This deliberately avoids `cd`: fish runs command substitutions in the current
+# shell rather than a subshell, so a `cd` inside one leaks out and would leave
+# the caller sitting in the install directory.
+function ei_resolve_dir --argument-names path
+    set -l raw (string replace -r '^~' "$HOME" -- $path)
+    if test -z "$raw"
+        return 0
+    end
+
+    if type -q path
+        set -l resolved (path resolve $raw 2>/dev/null)
+        if test -n "$resolved"
+            echo $resolved
+            return 0
+        end
+    end
+
+    # GNU `realpath -m` tolerates a directory that does not exist yet; the
+    # version without it does not, so it is only used when `path` is missing.
+    if command -q realpath
+        set -l resolved (realpath -m $raw 2>/dev/null)
+        if test -n "$resolved"
+            echo $resolved
+            return 0
+        end
+    end
+
+    # Lower on features than `path resolve`, which handles missing directories
+    # too; this only catches the remaining case, a relative path with nothing
+    # on disk to anchor to.
+    if string match -qv '^/' -- $raw; and test -n "$PWD"
+        echo "$PWD/$raw"
+        return 0
+    end
+
+    echo $raw
+end
+
+# Render a path the way the platform spells it.
+#
+# Under MSYS2 `$HOME` is `/c/Users/you`, which no Windows program can use.
+# `cygpath -m` gives the mixed form `C:/Users/you`: Windows accepts forward
+# slashes, and it is still valid when pasted back into a POSIX shell. Only
+# messages go through this — the paths handed to `cp`, `install` and `mkdir`
+# keep the shell's own spelling, which is what those tools expect.
+#
+# Without `cygpath` the path is printed as-is rather than rewritten by hand: a
+# `/x/...` path only maps to a drive when `/x` is a mount point, and guessing
+# mangles things like `/etc/hosts` into `E://etc/hosts`.
+function ei_display_path --argument-names path
+    if ei_is_windows; and ei_command_exists cygpath
+        cygpath -m $path
+        return 0
+    end
+
+    echo $path
+end
+
 # ---------------------------------------------------------------------------
 # Downloading and unpacking
 # ---------------------------------------------------------------------------
@@ -392,14 +483,17 @@ function ei_extract --argument-names archive dest name
         case '*.zip'
             if ei_command_exists unzip
                 unzip -q -o $archive -d $dest
-            else if ei_command_exists powershell
+            else if test -n (ei_powershell_bin)
+                # Bound to a variable: fish will not accept a command
+                # substitution in command position.
+                set -l ps_bin (ei_powershell_bin)
                 set -l ps_archive $archive
                 set -l ps_dest $dest
                 if ei_command_exists cygpath
                     set ps_archive (cygpath -w $archive)
                     set ps_dest (cygpath -w $dest)
                 end
-                powershell -NoProfile -Command "Expand-Archive -LiteralPath '$ps_archive' -DestinationPath '$ps_dest' -Force"
+                $ps_bin -NoProfile -Command "Expand-Archive -LiteralPath '$ps_archive' -DestinationPath '$ps_dest' -Force"
             else
                 ei_die 'unzip (or powershell) is required to extract .zip archives'
             end
@@ -457,44 +551,96 @@ function ei_check_disk_space --argument-names dir
     end
 
     if test $free -lt $EI_MIN_DISK_SPACE
-        ei_die (string join '' 'not enough disk space in ' $dir ': ' $free 'MB available, ' $EI_MIN_DISK_SPACE 'MB required')
+        ei_die (string join '' 'not enough disk space in ' (ei_display_path $dir) ': ' $free 'MB available, ' $EI_MIN_DISK_SPACE 'MB required')
     end
 end
 
 function ei_update_path_fish --argument-names dir
+    # A PATH entry for a directory that is not there is dead weight: nothing can
+    # ever be found through it, and the config only grows.
+    if not test -d "$dir"
+        ei_log (ei_display_path $dir)" does not exist; leaving PATH alone"
+        return 0
+    end
+
+    # Case-insensitively: on Windows `Path` and `path` are the same directory,
+    # so an exact match would add a second entry that does nothing. The odd
+    # false skip on a case-sensitive filesystem needs two directories differing
+    # only in case, which is not worth the duplicate it prevents.
+    #
+    # Both sides are lowered rather than using a flag: for fish's `contains`,
+    # `-i` means `--index`, not case-insensitive.
+    if contains -- (string lower -- $dir) (string lower -- $PATH)
+        ei_log (ei_display_path $dir)" is already on PATH"
+        return 0
+    end
+
     set -l cfg "$HOME/.config/fish/config.fish"
-    mkdir -p (dirname $cfg)
+    mkdir -p (dirname $cfg) 2>/dev/null
 
-    if test -f $cfg; and grep -Fq -- $dir $cfg 2>/dev/null
-        ei_log "$cfg already mentions $dir"
-    else
-        printf '\n# Added by the %s installer\nfish_add_path %s\n' $EI_BINARY_NAME $dir >> $cfg
-        ei_log "added $dir to $cfg"
+    if test -f $cfg; and grep -Fiq -- $dir $cfg 2>/dev/null
+        ei_log "$cfg already mentions "(ei_display_path $dir)
+        ei_log "restart your shell (or run: source $cfg) to pick up the change"
+        return 0
     end
 
-    if not contains -- $dir $PATH
-        set -gx PATH $dir $PATH
+    # A read-only home directory is unusual but not fatal: the binary is
+    # installed either way, so say what to add rather than aborting here.
+    if not printf '\n# Added by the %s installer\nfish_add_path %s\n' $EI_BINARY_NAME $dir >> $cfg 2>/dev/null
+        ei_log "could not write to $cfg"
+        ei_log 'add this to your fish config by hand:'
+        ei_log "  fish_add_path $dir"
+        return 0
     end
+
+    set -gx PATH $dir $PATH
+    ei_log "added "(ei_display_path $dir)" to $cfg"
     ei_log "restart your shell (or run: source $cfg) to pick up the change"
 end
 
 function ei_update_path_windows --argument-names dir
-    set -l win_dir $dir
-    if ei_command_exists cygpath
-        set win_dir (cygpath -w $dir)
-    end
-
-    if ei_command_exists powershell
-        powershell -NoProfile -Command "\$p = [Environment]::GetEnvironmentVariable('Path', 'User'); if ((\$p -split ';') -notcontains '$win_dir') { [Environment]::SetEnvironmentVariable('Path', \"\$p;$win_dir\", 'User') }"
-        if test $status -ne 0
-            ei_log 'could not update the Windows PATH automatically'
-        end
-        ei_log "added $win_dir to the user PATH"
-        ei_log 'restart your terminal to pick up the change'
+    # A PATH entry for a directory that is not there is dead weight: nothing can
+    # ever be found through it, and the registry only grows.
+    if not test -d "$dir"
+        ei_log (ei_display_path $dir)" does not exist; leaving PATH alone"
         return 0
     end
 
-    ei_log "add $dir to your PATH manually"
+    # Writing a POSIX path into the registry would be worse than doing nothing:
+    # nothing on Windows could use it. Without `cygpath` there is no trustworthy
+    # way to spell it, so leave the environment alone and say so.
+    if not ei_command_exists cygpath
+        ei_log "add "(ei_display_path $dir)" to your PATH manually"
+        return 0
+    end
+
+    # The PATH value keeps the native `C:\...` spelling. Slashes and letter case
+    # are normalised on both sides before comparing, because the registry may
+    # already hold `C:/x/y` or `c:\X\Y` for the very same directory.
+    set -l win_dir (cygpath -w $dir)
+
+    set -l ps (ei_powershell_bin)
+    if test -z "$ps"
+        ei_log "add "(ei_display_path $dir)" to your PATH manually"
+        return 0
+    end
+
+    # Prints `present` when the directory is already there, so the message can
+    # say which of the two things happened.
+    set -l result ($ps -NoProfile -Command "\$native = '$win_dir'.TrimEnd('\'); \$p = [Environment]::GetEnvironmentVariable('Path', 'User'); \$found = \$false; foreach (\$e in (\$p -split ';')) { if (\$e -and (\$e -replace '/','\').TrimEnd('\') -ieq \$native) { \$found = \$true; break } }; if (\$found) { 'present' } else { [Environment]::SetEnvironmentVariable('Path', \"\$p;\$native\", 'User') }" 2>/dev/null)
+    if test $status -ne 0
+        ei_log 'could not update the Windows PATH automatically'
+        ei_log "add "(ei_display_path $dir)" to your PATH manually"
+        return 0
+    end
+
+    if test "$result" = present
+        ei_log (ei_display_path $dir)" is already on the user PATH"
+        return 0
+    end
+
+    ei_log "added "(ei_display_path $dir)" to the user PATH"
+    ei_log 'restart your terminal to pick up the change'
 end
 
 # ---------------------------------------------------------------------------
@@ -525,7 +671,7 @@ function ei_validate_config
     end
 
     if test -n "$EI_FILE"; and not test -f "$EI_FILE"
-        ei_die "no such file: $EI_FILE"
+        ei_die "no such file: "(ei_display_path $EI_FILE)
     end
 end
 
@@ -545,7 +691,7 @@ function ei_main
         set -g EI_TAG $_flag_tag
     end
     if set -q _flag_dir
-        set -g EI_DIR (string replace -r '^~' "$HOME" $_flag_dir)
+        set -g EI_DIR (ei_resolve_dir $_flag_dir)
     end
     if set -q _flag_target
         set -g EI_TARGET $_flag_target
@@ -560,6 +706,10 @@ function ei_main
         set -g EI_FILE $_flag_file
     end
 
+    # `~` in the default and any relative `--dir` both become absolute here, so
+    # that whatever lands in a shell profile is usable from anywhere.
+    set -g EI_DIR (ei_resolve_dir $EI_DIR)
+
     if set -q _flag_list
         for target in $EI_SUPPORTED_TARGETS
             echo $target
@@ -567,6 +717,9 @@ function ei_main
         return 0
     end
 
+    # After the list check: `--list` is a question about this installer, not
+    # about a release, so it answers even with an unusable proxy or a missing
+    # --file.
     ei_validate_config
 
     set -l target (ei_resolve_target)
@@ -580,9 +733,9 @@ function ei_main
 
     set -l filename (ei_platform_filename $target)
     if test -n "$EI_FILE"
-        ei_log "installing $EI_BINARY_NAME ($target) from $EI_FILE"
+        ei_log "installing $EI_BINARY_NAME ($target) from "(ei_display_path $EI_FILE)
     else
-        ei_log "installing $EI_BINARY_NAME ($target) into $EI_DIR"
+        ei_log "installing $EI_BINARY_NAME ($target) into "(ei_display_path $EI_DIR)
     end
 
     ei_check_disk_space $EI_DIR
@@ -619,9 +772,9 @@ function ei_main
         cp $binary "$EI_DIR/$stem"
         chmod 0755 "$EI_DIR/$stem"
     end
-    or ei_die "could not install to $EI_DIR/$stem"
+    or ei_die "could not install to "(ei_display_path "$EI_DIR/$stem")
 
-    ei_log "installed $EI_DIR/$stem"
+    ei_log "installed "(ei_display_path "$EI_DIR/$stem")
 
     if ei_is_windows
         ei_update_path_windows $EI_DIR
@@ -630,8 +783,15 @@ function ei_main
     end
 
     if set -q GITHUB_PATH
-        echo $EI_DIR >> $GITHUB_PATH
-        ei_log "added $EI_DIR to GITHUB_PATH"
+        # The file is read by the CI runner, not by a person, so it gets the
+        # platform's own spelling: a POSIX path in a Windows runner's PATH is
+        # useless to everything but MSYS itself.
+        if ei_is_windows
+            echo (ei_windows_path $EI_DIR) >> $GITHUB_PATH
+        else
+            echo $EI_DIR >> $GITHUB_PATH
+        end
+        ei_log "added "(ei_display_path $EI_DIR)" to GITHUB_PATH"
     end
 
     ei_cleanup

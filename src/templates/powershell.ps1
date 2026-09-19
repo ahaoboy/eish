@@ -103,6 +103,19 @@ function Write-EiError {
     Write-Host ('error: ' + ($Message -join ' ')) -ForegroundColor Red
 }
 
+# Render a path the way the platform spells it.
+#
+# Windows writes `C:\Users\you\.ei`, but `/` is accepted everywhere Windows
+# takes a path, and it is the form the other installers print on Unix — so every
+# message uses it. Only messages: the paths handed to `Copy-Item`, `New-Item`
+# and `SetEnvironmentVariable` keep their native spelling, and are normalised
+# before being compared.
+function ConvertTo-EiDisplayPath {
+    param([string]$Path)
+    if (-not $Path) { return $Path }
+    return $Path -replace '\\', '/'
+}
+
 function Get-EiPlatformFilename {
     param([string]$Triple)
     if ($EiAssets.Contains($Triple)) { return $EiAssets[$Triple] }
@@ -221,11 +234,15 @@ function Resolve-EiTargetFromFile {
 
 function Expand-EiPath {
     param([string]$Path)
-    if ($Path -eq '~') { return $HOME }
-    if ($Path.StartsWith('~/') -or $Path.StartsWith('~\')) {
-        return (Join-Path $HOME $Path.Substring(2))
-    }
-    return $Path
+    if (-not $Path) { return $Path }
+
+    if ($Path -eq '~') { $Path = $HOME }
+    elseif ($Path.StartsWith('~/') -or $Path.StartsWith('~\')) { $Path = Join-Path $HOME $Path.Substring(2) }
+
+    # Absolute, so a relative -Dir cannot end up in a shell profile as
+    # `export PATH="relative/dir:..."`. `GetFullPath` also settles `/` against
+    # `\` and strips any trailing separator.
+    try { return [System.IO.Path]::GetFullPath($Path) } catch { return $Path }
 }
 
 function Get-EiDownloadUrl {
@@ -368,12 +385,19 @@ function Test-EiDiskSpace {
 
     $drive = (Get-Item -LiteralPath $probe).PSDrive
     if ($drive -and $drive.Free -lt ($MinDiskSpace * 1MB)) {
-        throw "not enough disk space in $Directory`: $([int]($drive.Free / 1MB))MB available, ${MinDiskSpace}MB required"
+        throw "not enough disk space in $(ConvertTo-EiDisplayPath $Directory)`": $([int]($drive.Free / 1MB))MB available, ${MinDiskSpace}MB required"
     }
 }
 
 function Add-EiToPath {
     param([string]$Directory)
+
+    # A PATH entry for a directory that is not there is dead weight: nothing can
+    # ever be found through it, and the environment or profile only grows.
+    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
+        Write-EiLog "$(ConvertTo-EiDisplayPath $Directory) does not exist; leaving PATH alone"
+        return
+    }
 
     if (Test-EiWindows) {
         # Normalise to a native path so that `C:/x/y` and `C:\x\y` dedupe.
@@ -384,16 +408,29 @@ function Add-EiToPath {
             try { [System.IO.Path]::GetFullPath($_) } catch { $_ }
         })
 
-        if ($existing -notcontains $native) {
-            $updated = (@($existing) + $native) -join ';'
-            [Environment]::SetEnvironmentVariable('Path', $updated, 'User')
-            Write-EiLog "added $native to the user PATH"
-            Write-EiLog 'restart your terminal to pick up the change'
-        } else {
-            Write-EiLog "$native is already on the user PATH"
+        # `-icontains`, not `-contains`: the default happens to be case
+        # insensitive too, but spelling it out keeps the intent visible.
+        if ($existing -icontains $native) {
+            Write-EiLog "$(ConvertTo-EiDisplayPath $native) is already on the user PATH"
+            $env:Path = "$env:Path;$native"
+            return
         }
 
+        $updated = (@($existing) + $native) -join ';'
+        [Environment]::SetEnvironmentVariable('Path', $updated, 'User')
+        Write-EiLog "added $(ConvertTo-EiDisplayPath $native) to the user PATH"
+        Write-EiLog 'restart your terminal to pick up the change'
+
         $env:Path = "$env:Path;$native"
+        return
+    }
+
+    # This branch only runs on a genuine Unix shell, so `:` is the separator.
+    # The comparison is case-insensitive for the same reason as the Windows
+    # branch above: a duplicate entry is worse than a case-only miss.
+    $onPath = @($env:Path -split ':' | Where-Object { $_ })
+    if ($onPath -icontains $Directory) {
+        Write-EiLog "$(ConvertTo-EiDisplayPath $Directory) is already on PATH"
         return
     }
 
@@ -405,16 +442,40 @@ function Add-EiToPath {
         default { Join-Path $HOME '.profile' }
     }
 
-    $line = if ($shell -eq 'fish') { "fish_add_path $Directory" } else { "export PATH=`"$Directory`:`$PATH`"" }
+    # A POSIX shell reads this file, so it gets the forward-slash spelling even
+    # when the path itself is a Windows one.
+    $shPath = ConvertTo-EiDisplayPath $Directory
+    $line = if ($shell -eq 'fish') { "fish_add_path $shPath" } else { "export PATH=`"$shPath`:`$PATH`"" }
 
-    if ((Test-Path -LiteralPath $config) -and (Select-String -LiteralPath $config -SimpleMatch $Directory -Quiet)) {
-        Write-EiLog "$config already mentions $Directory"
+    # Only a regular file can be read and appended to. A directory sitting at
+    # the profile path, or one that cannot be read, has to be treated as "no
+    # profile yet" rather than allowed to throw: `$ErrorActionPreference` is
+    # `Stop`, so an unguarded `Select-String` would abort the whole install
+    # after the binary was already in place.
+    $exists = Test-Path -LiteralPath $config -PathType Leaf
+    $mentioned = $false
+    if ($exists) {
+        try { $mentioned = [bool](Select-String -LiteralPath $config -SimpleMatch $shPath -Quiet -ErrorAction Stop) }
+        catch { $mentioned = $false }
+    }
+
+    if ($mentioned) {
+        Write-EiLog "$(ConvertTo-EiDisplayPath $config) already mentions $shPath"
     } else {
         if ($shell -eq 'fish') { New-Item -ItemType Directory -Path (Split-Path $config -Parent) -Force | Out-Null }
-        Add-Content -LiteralPath $config -Value "`n# Added by the $EiBinary installer`n$line"
-        Write-EiLog "added $Directory to $config"
+        try {
+            Add-Content -LiteralPath $config -Value "`n# Added by the $EiBinary installer`n$line" -ErrorAction Stop
+            Write-EiLog "added $shPath to $(ConvertTo-EiDisplayPath $config)"
+        } catch {
+            # A read-only home directory is unusual but not fatal: the binary is
+            # installed either way, so say what to add rather than aborting.
+            Write-EiLog "could not write to $(ConvertTo-EiDisplayPath $config)"
+            Write-EiLog 'add this to your shell profile by hand:'
+            Write-EiLog "  $line"
+            return
+        }
     }
-    Write-EiLog "restart your shell (or run: . $config) to pick up the change"
+    Write-EiLog "restart your shell (or run: . $(ConvertTo-EiDisplayPath $config)) to pick up the change"
 }
 
 function Show-EiUsage {
@@ -446,6 +507,8 @@ $((($EiAssets.Keys | ForEach-Object { "  $_" }) -join "`n"))
 }
 
 function Install-EiBinary {
+    # `-List` is a question about this installer, not about a release, so it is
+    # answered before the rest of the configuration is validated.
     if ($List) {
         $EiAssets.Keys | ForEach-Object { Write-Host $_ }
         return
@@ -460,7 +523,7 @@ function Install-EiBinary {
     }
 
     if ($File -and -not (Test-Path -LiteralPath $File -PathType Leaf)) {
-        throw "no such file: $File"
+        throw "no such file: $(ConvertTo-EiDisplayPath $File)"
     }
 
     $triple = Resolve-EiTarget
@@ -479,9 +542,9 @@ function Install-EiBinary {
     $installDir = Expand-EiPath $Dir
 
     if ($File) {
-        Write-EiLog "installing $EiBinary ($triple) from $File"
+        Write-EiLog "installing $EiBinary ($triple) from $(ConvertTo-EiDisplayPath $File)"
     } else {
-        Write-EiLog "installing $EiBinary ($triple) into $installDir"
+        Write-EiLog "installing $EiBinary ($triple) into $(ConvertTo-EiDisplayPath $installDir)"
     }
     Test-EiDiskSpace $installDir
 
@@ -510,12 +573,12 @@ function Install-EiBinary {
             if (Get-Command 'chmod' -ErrorAction SilentlyContinue) { & chmod 0755 $destination }
         }
 
-        Write-EiLog "installed $destination"
+        Write-EiLog "installed $(ConvertTo-EiDisplayPath $destination)"
         Add-EiToPath $installDir
 
         if ($env:GITHUB_PATH) {
             Add-Content -LiteralPath $env:GITHUB_PATH -Value $installDir
-            Write-EiLog "added $installDir to GITHUB_PATH"
+            Write-EiLog "added $(ConvertTo-EiDisplayPath $installDir) to GITHUB_PATH"
         }
     } finally {
         if ($EiTemp -and (Test-Path -LiteralPath $EiTemp)) {
