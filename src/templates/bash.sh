@@ -52,7 +52,12 @@ die() {
 }
 
 command_exists() {
-    command -v "$1" >/dev/null 2>&1
+    # `command -v` is the POSIX way to ask, but not every shell ships the
+    # `command` builtin: BusyBox `ash` on router firmware answers
+    # `command: not found` and returns 127, which would make every dependency
+    # below look absent. `type` answers the same question and is present in
+    # every Bourne shell, so it covers the gap.
+    command -v "$1" >/dev/null 2>&1 || type "$1" >/dev/null 2>&1
 }
 
 # Name of a PowerShell interpreter, or nothing if there is none.

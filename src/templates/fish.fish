@@ -363,7 +363,7 @@ function ei_resolve_dir --argument-names path
 
     # GNU `realpath -m` tolerates a directory that does not exist yet; the
     # version without it does not, so it is only used when `path` is missing.
-    if command -q realpath
+    if ei_command_exists realpath
         set -l resolved (realpath -m $raw 2>/dev/null)
         if test -n "$resolved"
             echo $resolved
