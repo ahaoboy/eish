@@ -325,17 +325,23 @@ end
 
 # The path as a Windows program spells it: backslashes, drive letter.
 #
-# This is for values a Windows program will consume — the registry, GITHUB_PATH
-# — not for anything a person reads; `ei_display_path` covers those. Without
-# `cygpath` the path is passed through rather than guessed: `GetFullPath` would
-# read `/c/Users/x` as a path on the current drive and produce `C:\c\Users\x`.
+# For values a Windows program will consume — the registry, GITHUB_PATH, a
+# PowerShell or `unzip` command line — not for anything a person reads, which is
+# `ei_display_path`'s job. The form is unambiguous to every Windows program,
+# which is the point: it does not depend on which MSYS installation the program
+# belongs to.
+#
+# Not for everything: `tar` reads a leading `C:` as a remote host name and
+# fails, so it keeps POSIX paths. The two guards below are the same pair
+# `ei_display_path` uses, so the two stay consistent: no `cygpath` at all off
+# Windows, and a host that has one by accident is left alone too.
 function ei_windows_path --argument-names path
-    if ei_command_exists cygpath
-        cygpath -w $path
+    if not ei_is_windows; or not ei_command_exists cygpath
+        echo $path
         return 0
     end
 
-    echo $path
+    cygpath -w $path
 end
 
 # Expand `~` and make the path absolute.
@@ -470,6 +476,8 @@ function ei_download --argument-names url out
 end
 
 function ei_extract --argument-names archive dest name
+    # Both paths are POSIX here; the `.zip` branch converts to a Windows form
+    # only for the program that needs it.
     switch $name
         case '*.tar.gz' '*.tgz'
             ei_command_exists tar; or ei_die 'tar is required to extract .tar.gz archives'
@@ -481,18 +489,25 @@ function ei_extract --argument-names archive dest name
             ei_command_exists tar; or ei_die 'tar is required to extract .tar.bz2 archives'
             tar -xjf $archive -C $dest
         case '*.zip'
+            # The only case that has to be handed a Windows path. `/tmp/x` means
+            # whichever root the running program belongs to: this shell's
+            # `unzip` finds it, but the `unzip` shipped with Git for Windows
+            # looks under `C:\Program Files\Git` and reports the archive
+            # missing — which is exactly what a CI runner hits, because Git's
+            # bin directory is on PATH there. `C:\...` has no such ambiguity
+            # and is accepted by MSYS2's, Git's and Cygwin's `unzip` alike.
+            #
+            # Nothing else is converted: `tar` reads a leading `C:` as a remote
+            # host, and `gzip` and `curl` do not need it, so leaving them alone
+            # avoids that trap.
             if ei_command_exists unzip
-                unzip -q -o $archive -d $dest
+                unzip -q -o (ei_windows_path $archive) -d (ei_windows_path $dest)
             else if test -n (ei_powershell_bin)
                 # Bound to a variable: fish will not accept a command
                 # substitution in command position.
                 set -l ps_bin (ei_powershell_bin)
-                set -l ps_archive $archive
-                set -l ps_dest $dest
-                if ei_command_exists cygpath
-                    set ps_archive (cygpath -w $archive)
-                    set ps_dest (cygpath -w $dest)
-                end
+                set -l ps_archive (ei_windows_path $archive)
+                set -l ps_dest (ei_windows_path $dest)
                 $ps_bin -NoProfile -Command "Expand-Archive -LiteralPath '$ps_archive' -DestinationPath '$ps_dest' -Force"
             else
                 ei_die 'unzip (or powershell) is required to extract .zip archives'
